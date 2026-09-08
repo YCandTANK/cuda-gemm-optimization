@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+*.o
+*.out
+*.so
+
+# Executables
+gemm_naive
+gemm_coalesced
+gemm_tiled
+gemm_thread_tiling
+gemm_register_tiling
+
+# CUDA / profiling outputs
+*.ncu-rep
+*.nsys-rep
+
+# VS Code
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
