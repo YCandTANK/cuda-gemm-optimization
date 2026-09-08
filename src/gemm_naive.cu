@@ -58,21 +58,33 @@ void gemmCPU(
 
 int main(){
     //初始化数据
-    int M = 2;
-    int K = 3;
-    int N = 4;
+    int M = 1024;
+    int K = 1024;
+    int N = 1024;
+
+    constexpr int BLOCK_X = 16;
+    constexpr int BLOCK_Y = 16;
+
+    const int warmup_runs = 10;
+    const int benchmark_runs = 100;
+
+    dim3 block(BLOCK_X, BLOCK_Y);
+    dim3 grid(
+        (N + block.x - 1) / block.x,
+        (M + block.y - 1) / block.y
+    );
 
     //准备Host数据
-    vector<float> h_A = {
-        1, 2, 3,
-        4, 5, 6
-    };
+    vector<float> h_A(M * K);
+    vector<float> h_B(K * N);
 
-    vector<float> h_B = {
-        1, 2, 3, 4,
-        5, 6, 7, 8,
-        9, 10, 11, 12
-    };
+    for (int i = 0; i < M * K; ++i) {
+        h_A[i] = static_cast<float>((i % 17) - 8) / 10.0f;
+    }
+
+    for (int i = 0; i < K * N; ++i) {
+        h_B[i] = static_cast<float>((i % 13) - 6) / 10.0f;
+    }
 
     vector<float> h_cpu_C(M * N);
     vector<float> h_gpu_C(M * N);
@@ -108,17 +120,61 @@ int main(){
         cudaMemcpyHostToDevice
     ));
 
-    //kernel launch
-    dim3 block(16, 16);
-    dim3 grid(
-        (N + block.x - 1) / block.x,
-        (M + block.y - 1) / block.y
-    );
-
-    gemmNaive<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    //warm up
+    for(int i = 0; i < warmup_runs; ++i) {
+        gemmNaive<<<grid, block>>>(
+            d_A, d_B, d_C,
+            M, N, K
+        );
+    }
 
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
+
+    //创建event来计时
+    cudaEvent_t start, stop;
+    
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    //kernel launch
+    CHECK_CUDA(cudaEventRecord(start));
+
+    for (int i = 0; i < benchmark_runs; ++i) {
+        gemmNaive<<<grid, block>>>(
+            d_A, d_B, d_C,
+            M, N, K
+        );
+    }
+
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    //计时
+    float total_ms = 0.0f;
+
+    CHECK_CUDA(
+        cudaEventElapsedTime(
+            &total_ms,
+            start,
+            stop
+        )
+    );
+
+    float avg_ms = total_ms / benchmark_runs;
+
+    //计算GFLOPS
+    //floating-point operations（浮点运算次数）
+    double flops =2.0 * static_cast<double>(M) * static_cast<double>(N) * static_cast<double>(K);
+    double seconds = avg_ms / 1000.0;//毫秒转换成秒
+    double gflops = flops / seconds / 1e9; 
+
+    cout << "Average latency = "
+        << avg_ms << " ms" << endl;
+
+    cout << "Performance = "
+        << gflops << " GFLOPS" << endl;
 
     //D2H
     CHECK_CUDA(cudaMemcpy(
@@ -151,6 +207,8 @@ int main(){
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
     CHECK_CUDA(cudaFree(d_C));
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
 
     return 0;
 }
