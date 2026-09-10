@@ -24,6 +24,8 @@ do {                                                                 \
     }                                                                \
 } while (0)
 
+constexpr int TILE_SIZE = 16;
+
 __global__ void gemmNaive(
     const float* A,
     const float* B,
@@ -45,6 +47,60 @@ __global__ void gemmNaive(
         C[row * N + col] = sum;
     }
 
+}
+
+__global__ void gemmTiled(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+
+    float sum = 0.0f;
+
+    for(int tile = 0; tile < (K + TILE_SIZE - 1) / TILE_SIZE; tile++){
+        int row_A = row;
+        int col_A = tile * TILE_SIZE + tx;
+        int row_B = tile * TILE_SIZE + ty;
+        int col_B = col;
+
+        //存入
+        if(row_A < M && col_A < K){
+            As[ty][tx] = A[row_A * K + col_A];
+        }else{
+            As[ty][tx] = 0.0f;
+        }
+
+        if(row_B < K && col_B < N){
+            Bs[ty][tx] = B[row_B * N + col_B];
+        }else{
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        //计算sum
+        for(int k = 0; k < TILE_SIZE; k++){
+            sum += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    //写结果
+    if(row < M && col < N){
+        C[row * N + col] = sum;
+    }
 }
 
 //CPU Reference
@@ -69,17 +125,14 @@ void gemmCPU(
 
 int main(){
     //初始化数据
-    int M = 1024;
-    int K = 1024;
-    int N = 1024;
-
-    constexpr int BLOCK_X = 16;
-    constexpr int BLOCK_Y = 16;
+    M = 1024;
+    N = 1024;
+    K = 1024;
 
     const int warmup_runs = 10;
     const int benchmark_runs = 100;
 
-    dim3 block(BLOCK_X, BLOCK_Y);
+    dim3 block(TILE_SIZE, TILE_SIZE);
     dim3 grid(
         (N + block.x - 1) / block.x,
         (M + block.y - 1) / block.y
@@ -99,6 +152,7 @@ int main(){
 
     vector<float> h_cpu_C(M * N);
     vector<float> h_gpu_C(M * N);
+    vector<float> h_tiled_C(M * N);
     vector<float> h_cublas_C(M * N);
 
     //CPU Reference
@@ -108,6 +162,7 @@ int main(){
     float* d_A = nullptr;
     float* d_B = nullptr;
     float* d_C_naive = nullptr;
+    float* d_C_tiled = nullptr;
     float* d_C_cublas = nullptr;
 
     size_t A_bytes = static_cast<size_t>(M) * K * sizeof(float);
@@ -117,6 +172,7 @@ int main(){
     CHECK_CUDA(cudaMalloc(&d_A, A_bytes));
     CHECK_CUDA(cudaMalloc(&d_B, B_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_naive, C_bytes));
+    CHECK_CUDA(cudaMalloc(&d_C_tiled, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_cublas, C_bytes));
 
     //H2D
@@ -189,6 +245,67 @@ int main(){
 
     cout << "Naive GFLOPS = "
         << gflops << endl;
+
+
+/************************************************************************************ */
+
+    //Tiled warm up
+    for(int i = 0; i < warmup_runs; ++i) {
+        gemmTiled<<<grid, block>>>(
+            d_A, d_B, d_C_tiled,
+            M, N, K
+        );
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    //创建Tiled event来计时
+    cudaEvent_t tiled_start, tiled_stop;
+
+    CHECK_CUDA(cudaEventCreate(&tiled_start));
+    CHECK_CUDA(cudaEventCreate(&tiled_stop));
+
+    CHECK_CUDA(cudaEventRecord(tiled_start));
+
+    for (int i = 0; i < benchmark_runs; ++i) {
+        gemmTiled<<<grid, block>>>(
+            d_A, d_B, d_C_tiled,
+            M, N, K
+        );
+    }
+
+    CHECK_CUDA(cudaEventRecord(tiled_stop));
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventSynchronize(tiled_stop));
+
+    float tiled_total_ms = 0.0f;
+
+    CHECK_CUDA(
+        cudaEventElapsedTime(
+            &tiled_total_ms,
+            tiled_start,
+            tiled_stop
+        )
+    );
+
+    float tiled_avg_ms =
+        tiled_total_ms / benchmark_runs;
+
+    double tiled_gflops =
+        flops / (tiled_avg_ms / 1000.0) / 1e9;
+
+    cout << "Tiled average latency = "
+        << tiled_avg_ms << " ms" << endl;
+
+    cout << "Tiled GFLOPS = "
+        << tiled_gflops << endl;
+
+    double tiled_naive_speedup =
+        tiled_gflops / gflops;
+
+    cout << "Tiled / Naive speedup = "
+        << tiled_naive_speedup << endl;
 
 
 /************************************************************************************ */
@@ -277,10 +394,25 @@ int main(){
     cout << "Naive GFLOPS / cuBLAS GFLOPS = "
         << naive_cublas_percentage << "%" << endl;
 
+    double tiled_cublas_percentage =
+        tiled_gflops / cublas_gflops * 100.0;
+
+    cout << "Tiled GFLOPS / cuBLAS GFLOPS = "
+        << tiled_cublas_percentage << "%" << endl;
+
+/******************************************************************************** */
+
     //D2H
     CHECK_CUDA(cudaMemcpy(
         h_gpu_C.data(),
         d_C_naive,
+        C_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    CHECK_CUDA(cudaMemcpy(
+        h_tiled_C.data(),
+        d_C_tiled,
         C_bytes,
         cudaMemcpyDeviceToHost
     ));
@@ -312,6 +444,26 @@ int main(){
         cout << "Naive: Mismatch!" << endl;
     }
 
+    //Tiled正确性检验
+    float tiled_max_abs_error = 0.0f;
+
+    for (int i = 0; i < M * N; i++) {
+        float error =
+            fabsf(h_cpu_C[i] - h_tiled_C[i]);
+
+        tiled_max_abs_error =
+            max(tiled_max_abs_error, error);
+    }
+
+    cout << "Tiled max absolute error = "
+        << tiled_max_abs_error << endl;
+
+    if (tiled_max_abs_error < 1e-5f) {
+        cout << "Tiled: Correct!" << endl;
+    } else {
+        cout << "Tiled: Mismatch!" << endl;
+    }
+
     //cuBLAS正确性检验
     float cublas_max_abs_error = 0.0f;
 
@@ -335,9 +487,12 @@ int main(){
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
     CHECK_CUDA(cudaFree(d_C_naive));
+    CHECK_CUDA(cudaFree(d_C_tiled));
     CHECK_CUDA(cudaFree(d_C_cublas));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
+    CHECK_CUDA(cudaEventDestroy(tiled_start));
+    CHECK_CUDA(cudaEventDestroy(tiled_stop));
     CHECK_CUDA(cudaEventDestroy(cublas_start));
     CHECK_CUDA(cudaEventDestroy(cublas_stop));
     CHECK_CUBLAS(cublasDestroy(handle));
