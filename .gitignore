@@ -21,3 +21,4 @@ gemm_register_tiling
 # Python cache
 __pycache__/
 *.pyc
+/gemm
