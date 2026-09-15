@@ -36,6 +36,13 @@ constexpr int BK_V3 = 16;
 constexpr int TM_V3 = 4;
 constexpr int TN_V3 = 4;
 
+constexpr int BM_V4 = 64;
+constexpr int BN_V4 = 64;
+constexpr int BK_V4 = 16;
+constexpr int TM_V4 = 4;
+constexpr int TN_V4 = 4;
+constexpr int VEC = 4;
+
 //V0
 __global__ void gemmNaive(
     const float* A,
@@ -292,6 +299,139 @@ __global__ void gemm2DThreadTiled(
     }
 }
 
+//V4
+__global__ void gemm2DThreadTiledVectorized(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int tid = ty * blockDim.x + tx;//thread 在 block 内线性编号
+
+    __shared__ float As[BM_V4][BK_V4];
+    __shared__ float Bs[BK_V4][BN_V4];
+
+    float sum[TM_V4][TN_V4] = {0.0f};
+
+    //local_row/local_col → 访问 Shared Memory
+    int local_row = ty * TM_V4;
+    int local_col = tx * TN_V4;
+
+    //C Tile中左上角数据坐标
+    //global_row/global_col → 写 Global C
+    int global_row = blockIdx.y * BM_V4 + local_row;
+    int global_col = blockIdx.x * BN_V4 + local_col;
+
+    //将显存中的A，B数据写到共享内存As，Bs
+    for(int tile = 0; tile < (K + BK_V4 - 1) / BK_V4; tile++){
+        //A -> As
+        int a_vecs_per_row = BK_V4 / VEC;
+
+        //计算As的起始行列坐标
+        int row_As = tid / a_vecs_per_row;
+        int col_As = (tid % a_vecs_per_row) * VEC;
+
+        //计算A的起始行列坐标,为了计算linear_idx_A
+        int row_A = blockIdx.y * BM_V4 + row_As;
+        int col_A = tile * BK_V4 + col_As;
+
+        //计算A起始坐标的线性坐标，用于判断是否16bytes对齐
+        int linear_idx_A = row_A * K + col_A;
+
+        //搬取数据
+        if(row_A < M && col_A + VEC - 1 < K && linear_idx_A % VEC == 0){//边界合法且16字节对齐
+            float4 vec = *reinterpret_cast<const float4*>(&A[linear_idx_A]);//使用float4一次性取4个数据
+            As[row_As][col_As + 0] = vec.x;
+            As[row_As][col_As + 1] = vec.y;
+            As[row_As][col_As + 2] = vec.z;
+            As[row_As][col_As + 3] = vec.w;
+        }else{
+            for(int i = 0; i < VEC; i++){
+                int current_col_A = col_A + i;
+
+                if(row_A < M && current_col_A < K){
+                    As[row_As][col_As + i] = A[linear_idx_A + i];
+                }else{
+                    As[row_As][col_As + i] = 0.0f;
+                }
+            }
+        }
+
+        //B -> Bs
+        int b_vecs_per_row = BN_V4 / VEC;
+
+        //Bs坐标
+        int row_Bs = tid / b_vecs_per_row;
+        int col_Bs = (tid % b_vecs_per_row) * VEC;
+
+        //B坐标
+        int row_B = tile * BK_V4 + row_Bs;
+        int col_B = blockIdx.x * BN_V4 + col_Bs;
+
+        int linear_idx_B = row_B * N + col_B;
+
+        if(row_B < K && col_B + VEC - 1 < N && linear_idx_B % VEC == 0){
+            float4 vec = *reinterpret_cast<const float4*>(&B[linear_idx_B]);
+            Bs[row_Bs][col_Bs + 0] = vec.x;
+            Bs[row_Bs][col_Bs + 1] = vec.y;
+            Bs[row_Bs][col_Bs + 2] = vec.z;
+            Bs[row_Bs][col_Bs + 3] = vec.w;
+        }else{
+            for(int i = 0; i < VEC; i++){
+                int current_col_B = col_B + i;
+
+                if(row_B < K && current_col_B < N){
+                    Bs[row_Bs][col_Bs + i] =
+                        B[row_B * N + current_col_B];
+                }else{
+                    Bs[row_Bs][col_Bs + i] = 0.0f;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        //计算乘加
+        for(int k = 0; k < BK_V4; k++){
+            float reg_A[TM_V4];
+            float reg_B[TN_V4];
+            //As -> reg_A
+            for(int i = 0; i < TM_V4; i++){
+                reg_A[i] = As[local_row + i][k];
+            }
+            //Bs -> reg_B
+            for(int i = 0; i < TN_V4; i++){
+                reg_B[i] = Bs[k][local_col + i];
+            }
+            //计算sum
+            for(int i = 0; i < TM_V4; i++){
+                for(int j = 0; j < TN_V4; j++){
+                    sum[i][j] += reg_A[i] * reg_B[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    //结果写回C
+    for(int i = 0; i < TM_V4; i++){
+        for(int j = 0; j < TN_V4; j++){
+            //计算C的行列
+            int row_C = global_row + i;
+            int col_C = global_col + j;
+            if(row_C < M && col_C < N){
+                C[row_C * N + col_C] = sum[i][j];
+            }
+        }
+    }
+}
+
 //CPU Reference
 void gemmCPU(
     const float* A,
@@ -350,6 +490,15 @@ int main(){
         (M + BM_V3 - 1) / BM_V3
     );
 
+    dim3 block_v4(
+        BN_V4 / TN_V4,
+        BM_V4 / TM_V4
+    );
+    dim3 grid_v4(
+        (N + BN_V4 - 1) / BN_V4,
+        (M + BM_V4 - 1) / BM_V4
+    );
+
     //准备Host数据
     vector<float> h_A(M * K);
     vector<float> h_B(K * N);
@@ -367,6 +516,7 @@ int main(){
     vector<float> h_tiled_C(M * N);
     vector<float> h_thread_tiled_C(M * N);
     vector<float> h_2d_thread_tiled_C(M * N);
+    vector<float> h_vectorized_C(M * N);
     vector<float> h_cublas_C(M * N);
 
     //CPU Reference
@@ -379,6 +529,7 @@ int main(){
     float* d_C_tiled = nullptr;
     float* d_C_thread_tiled = nullptr;
     float* d_C_2d_thread_tiled = nullptr;
+    float* d_C_vectorized = nullptr;
     float* d_C_cublas = nullptr;
 
     size_t A_bytes = static_cast<size_t>(M) * K * sizeof(float);
@@ -391,6 +542,7 @@ int main(){
     CHECK_CUDA(cudaMalloc(&d_C_tiled, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_thread_tiled, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_2d_thread_tiled, C_bytes));
+    CHECK_CUDA(cudaMalloc(&d_C_vectorized, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_cublas, C_bytes));
 
     //H2D
@@ -689,6 +841,94 @@ int main(){
 
 /************************************************************************************ */
 
+    //Vectorized warm up
+    for(int i = 0; i < warmup_runs; ++i) {
+        gemm2DThreadTiledVectorized<<<grid_v4, block_v4>>>(
+            d_A,
+            d_B,
+            d_C_vectorized,
+            M,
+            N,
+            K
+        );
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    //创建Vectorized event来计时
+    cudaEvent_t vectorized_start, vectorized_stop;
+
+    CHECK_CUDA(cudaEventCreate(&vectorized_start));
+    CHECK_CUDA(cudaEventCreate(&vectorized_stop));
+
+    CHECK_CUDA(cudaEventRecord(vectorized_start));
+
+    for (int i = 0; i < benchmark_runs; ++i) {
+        gemm2DThreadTiledVectorized<<<grid_v4, block_v4>>>(
+            d_A,
+            d_B,
+            d_C_vectorized,
+            M,
+            N,
+            K
+        );
+    }
+
+    CHECK_CUDA(cudaEventRecord(vectorized_stop));
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventSynchronize(vectorized_stop));
+
+    float vectorized_total_ms = 0.0f;
+
+    CHECK_CUDA(
+        cudaEventElapsedTime(
+            &vectorized_total_ms,
+            vectorized_start,
+            vectorized_stop
+        )
+    );
+
+    float vectorized_avg_ms =
+        vectorized_total_ms / benchmark_runs;
+
+    double vectorized_gflops =
+        flops / (vectorized_avg_ms / 1000.0) / 1e9;
+
+    cout << "Vectorized average latency = "
+        << vectorized_avg_ms << " ms" << endl;
+
+    cout << "Vectorized GFLOPS = "
+        << vectorized_gflops << endl;
+
+    double vectorized_naive_speedup =
+        vectorized_gflops / gflops;
+
+    cout << "Vectorized / Naive speedup = "
+        << vectorized_naive_speedup << endl;
+
+    double vectorized_tiled_speedup =
+        vectorized_gflops / tiled_gflops;
+
+    cout << "Vectorized / Tiled speedup = "
+        << vectorized_tiled_speedup << endl;
+
+    double vectorized_thread_tiled_speedup =
+        vectorized_gflops / thread_tiled_gflops;
+
+    cout << "Vectorized / Thread Tiled speedup = "
+        << vectorized_thread_tiled_speedup << endl;
+
+    double vectorized_thread_tiled_2d_speedup =
+        vectorized_gflops / thread_tiled_2d_gflops;
+
+    cout << "Vectorized / 2D Thread Tiled speedup = "
+        << vectorized_thread_tiled_2d_speedup << endl;
+
+    cout<<endl;
+
+/************************************************************************************ */
+
     //创建 cuBLAS handle，执行cuBLAS内的工业级GEMM，以此为参照
     cublasHandle_t handle;
 
@@ -791,6 +1031,12 @@ int main(){
     cout << "2D Thread Tiled GFLOPS / cuBLAS GFLOPS = "
         << thread_tiled_2d_cublas_percentage << " %" << endl;
 
+    double vectorized_cublas_percentage =
+        vectorized_gflops / cublas_gflops * 100.0;
+
+    cout << "Vectorized GFLOPS / cuBLAS GFLOPS = "
+        << vectorized_cublas_percentage << " %" << endl;
+
 /******************************************************************************** */
 
     //D2H
@@ -818,6 +1064,13 @@ int main(){
     CHECK_CUDA(cudaMemcpy(
         h_2d_thread_tiled_C.data(),
         d_C_2d_thread_tiled,
+        C_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    CHECK_CUDA(cudaMemcpy(
+        h_vectorized_C.data(),
+        d_C_vectorized,
         C_bytes,
         cudaMemcpyDeviceToHost
     ));
@@ -916,6 +1169,28 @@ int main(){
     }
 
     cout<<endl;
+
+    //Vectorized正确性检验
+    float vectorized_max_abs_error = 0.0f;
+
+    for (int i = 0; i < M * N; i++) {
+        float error =
+            fabsf(h_cpu_C[i] - h_vectorized_C[i]);
+
+        vectorized_max_abs_error =
+            max(vectorized_max_abs_error, error);
+    }
+
+    cout << "Vectorized max absolute error = "
+        << vectorized_max_abs_error << endl;
+
+    if (vectorized_max_abs_error < 1e-5f) {
+        cout << "Vectorized: Correct!" << endl;
+    } else {
+        cout << "Vectorized: Mismatch!" << endl;
+    }
+
+    cout<<endl;
     
     //cuBLAS正确性检验
     float cublas_max_abs_error = 0.0f;
@@ -945,6 +1220,7 @@ int main(){
     CHECK_CUDA(cudaFree(d_C_tiled));
     CHECK_CUDA(cudaFree(d_C_thread_tiled));
     CHECK_CUDA(cudaFree(d_C_2d_thread_tiled));
+    CHECK_CUDA(cudaFree(d_C_vectorized));
     CHECK_CUDA(cudaFree(d_C_cublas));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
@@ -954,6 +1230,8 @@ int main(){
     CHECK_CUDA(cudaEventDestroy(thread_tiled_stop));
     CHECK_CUDA(cudaEventDestroy(thread_tiled_2d_start));
     CHECK_CUDA(cudaEventDestroy(thread_tiled_2d_stop));
+    CHECK_CUDA(cudaEventDestroy(vectorized_start));
+    CHECK_CUDA(cudaEventDestroy(vectorized_stop));
     CHECK_CUDA(cudaEventDestroy(cublas_start));
     CHECK_CUDA(cudaEventDestroy(cublas_stop));
     CHECK_CUBLAS(cublasDestroy(handle));
