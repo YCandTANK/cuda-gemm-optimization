@@ -50,6 +50,13 @@ constexpr int TM_V5 = 4;
 constexpr int TN_V5 = 4;
 constexpr int VEC_V5 = 4;
 
+constexpr int BM_V6 = 64;
+constexpr int BN_V6 = 64;
+constexpr int BK_V6 = 16;
+constexpr int TM_V6 = 4;
+constexpr int TN_V6 = 4;
+constexpr int VEC_V6 = 4;
+
 //V0
 __global__ void gemmNaive(
     const float* A,
@@ -568,6 +575,149 @@ __global__ void gemm2DThreadTiledVectorizedSharedStore(
     }
 }
 
+//V6
+__global__ void gemm2DThreadTiledVectorizedGlobalStore(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int tid = ty * blockDim.x + tx;//thread 在 block 内线性编号
+
+    __shared__ __align__(16) float As[BM_V6][BK_V6];
+    __shared__ __align__(16) float Bs[BK_V6][BN_V6];
+
+    float sum[TM_V6][TN_V6] = {0.0f};
+
+    //local_row/local_col → 访问 Shared Memory
+    int local_row = ty * TM_V6;
+    int local_col = tx * TN_V6;
+
+    //C Tile中左上角数据坐标
+    //global_row/global_col → 写 Global C
+    int global_row = blockIdx.y * BM_V6 + local_row;
+    int global_col = blockIdx.x * BN_V6 + local_col;
+
+    for(int tile = 0; tile < (K + BK_V6 - 1) / BK_V6; tile++){
+        //将显存中的A，B数据写到共享内存As，Bs
+        //A -> As
+        int a_vecs_per_row = BK_V6 / VEC_V6;
+
+        //计算As的起始行列坐标
+        int row_As = tid / a_vecs_per_row;
+        int col_As = (tid % a_vecs_per_row) * VEC_V6;
+
+        //计算A的起始行列坐标,为了计算linear_idx_A
+        int row_A = blockIdx.y * BM_V6 + row_As;
+        int col_A = tile * BK_V6 + col_As;
+
+        //计算A起始坐标的线性坐标，用于判断是否16bytes对齐
+        int linear_idx_A = row_A * K + col_A;
+
+        //搬取数据
+        if(row_A < M && col_A + VEC_V6 - 1 < K && linear_idx_A % VEC_V6 == 0){//边界合法且16字节对齐
+            float4 vec = *reinterpret_cast<const float4*>(&A[linear_idx_A]);//使用float4一次性取4个数据
+
+            *reinterpret_cast<float4*>(&As[row_As][col_As]) = vec;//使用float4将之前取的数据存入shared memory
+        }else{
+            for(int i = 0; i < VEC_V6; i++){
+                int current_col_A = col_A + i;
+
+                if(row_A < M && current_col_A < K){
+                    As[row_As][col_As + i] = A[linear_idx_A + i];
+                }else{
+                    As[row_As][col_As + i] = 0.0f;
+                }
+            }
+        }
+
+        //B -> Bs
+        int b_vecs_per_row = BN_V6 / VEC_V6;
+
+        //Bs坐标
+        int row_Bs = tid / b_vecs_per_row;
+        int col_Bs = (tid % b_vecs_per_row) * VEC_V6;
+
+        //B坐标
+        int row_B = tile * BK_V6 + row_Bs;
+        int col_B = blockIdx.x * BN_V6 + col_Bs;
+
+        int linear_idx_B = row_B * N + col_B;
+
+        if(row_B < K && col_B + VEC_V6 - 1 < N && linear_idx_B % VEC_V6 == 0){
+            float4 vec = *reinterpret_cast<const float4*>(&B[linear_idx_B]);
+
+            *reinterpret_cast<float4*>(&Bs[row_Bs][col_Bs]) = vec;
+        }else{
+            for(int i = 0; i < VEC_V6; i++){
+                int current_col_B = col_B + i;
+
+                if(row_B < K && current_col_B < N){
+                    Bs[row_Bs][col_Bs + i] =
+                        B[row_B * N + current_col_B];
+                }else{
+                    Bs[row_Bs][col_Bs + i] = 0.0f;
+                }
+            }
+        }
+
+        __syncthreads();
+
+        //计算乘加
+        for(int k = 0; k < BK_V6; k++){
+            float reg_A[TM_V6];
+            float reg_B[TN_V6];
+            //As -> reg_A
+            for(int i = 0; i < TM_V6; i++){
+                reg_A[i] = As[local_row + i][k];
+            }
+            //Bs -> reg_B
+            for(int i = 0; i < TN_V6; i++){
+                reg_B[i] = Bs[k][local_col + i];
+            }
+            //计算sum
+            for(int i = 0; i < TM_V6; i++){
+                for(int j = 0; j < TN_V6; j++){
+                    sum[i][j] += reg_A[i] * reg_B[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    //结果写回C，V6优化了这个，新增fast path，以float4写回C
+    for(int i = 0; i < TM_V6; i++){
+        //确定C的行
+        int row_C = global_row + i;
+        int linear_idx_C = row_C * N + global_col;
+
+        if(row_C < M && global_col + VEC_V6 - 1 < N && linear_idx_C % VEC_V6 == 0){//没超出边界、符合16 byte对齐，进入fast path
+            float4 out = make_float4(
+                sum[i][0],
+                sum[i][1],
+                sum[i][2],
+                sum[i][3]
+            );
+    
+            *reinterpret_cast<float4*>(&C[linear_idx_C]) = out;
+        }else{
+            for(int j = 0; j < TN_V6; j++){
+                int col_C = global_col + j;
+
+                if(row_C < M && col_C < N){
+                    C[row_C * N + col_C] = sum[i][j];
+                }
+            }
+        }
+    }
+}
+
 //CPU Reference
 void gemmCPU(
     const float* A,
@@ -644,6 +794,15 @@ int main(){
         (M + BM_V5 - 1) / BM_V5
     );
 
+    dim3 block_v6(
+        BN_V6 / TN_V6,
+        BM_V6 / TM_V6
+    );
+    dim3 grid_v6(
+        (N + BN_V6 - 1) / BN_V6,
+        (M + BM_V6 - 1) / BM_V6
+    );
+
     //准备Host数据
     vector<float> h_A(M * K);
     vector<float> h_B(K * N);
@@ -663,6 +822,7 @@ int main(){
     vector<float> h_2d_thread_tiled_C(M * N);
     vector<float> h_vectorized_C(M * N);
     vector<float> h_shared_store_C(M * N);
+    vector<float> h_global_store_C(M * N);
     vector<float> h_cublas_C(M * N);
 
     //CPU Reference
@@ -677,6 +837,7 @@ int main(){
     float* d_C_2d_thread_tiled = nullptr;
     float* d_C_vectorized = nullptr;
     float* d_C_shared_store = nullptr;
+    float* d_C_global_store = nullptr;
     float* d_C_cublas = nullptr;
 
     size_t A_bytes = static_cast<size_t>(M) * K * sizeof(float);
@@ -691,6 +852,7 @@ int main(){
     CHECK_CUDA(cudaMalloc(&d_C_2d_thread_tiled, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_vectorized, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_shared_store, C_bytes));
+    CHECK_CUDA(cudaMalloc(&d_C_global_store, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_cublas, C_bytes));
 
     //H2D
@@ -1079,7 +1241,7 @@ int main(){
 
     //Vectorized Shared Store V1 warm up
     for(int i = 0; i < warmup_runs; ++i) {
-        gemm2DThreadTiledVectorizedSharedStore_v1<<<grid_v5, block_v5>>>(
+        gemm2DThreadTiledVectorizedSharedStore<<<grid_v5, block_v5>>>(
             d_A,
             d_B,
             d_C_shared_store,
@@ -1100,7 +1262,7 @@ int main(){
     CHECK_CUDA(cudaEventRecord(shared_store_start));
 
     for (int i = 0; i < benchmark_runs; ++i) {
-        gemm2DThreadTiledVectorizedSharedStore_v1<<<grid_v5, block_v5>>>(
+        gemm2DThreadTiledVectorizedSharedStore<<<grid_v5, block_v5>>>(
             d_A,
             d_B,
             d_C_shared_store,
@@ -1141,6 +1303,75 @@ int main(){
 
     cout << "V5 / V4 speedup = "
         << shared_store_vectorized_speedup << endl;
+
+    cout<<endl;
+
+/************************************************************************************ */
+
+    //Vectorized Global Store warm up
+    for(int i = 0; i < warmup_runs; ++i) {
+        gemm2DThreadTiledVectorizedGlobalStore<<<grid_v6, block_v6>>>(
+            d_A,
+            d_B,
+            d_C_global_store,
+            M,
+            N,
+            K
+        );
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t global_store_start, global_store_stop;
+
+    CHECK_CUDA(cudaEventCreate(&global_store_start));
+    CHECK_CUDA(cudaEventCreate(&global_store_stop));
+
+    CHECK_CUDA(cudaEventRecord(global_store_start));
+
+    for (int i = 0; i < benchmark_runs; ++i) {
+        gemm2DThreadTiledVectorizedGlobalStore<<<grid_v6, block_v6>>>(
+            d_A,
+            d_B,
+            d_C_global_store,
+            M,
+            N,
+            K
+        );
+    }
+
+    CHECK_CUDA(cudaEventRecord(global_store_stop));
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventSynchronize(global_store_stop));
+
+    float global_store_total_ms = 0.0f;
+
+    CHECK_CUDA(
+        cudaEventElapsedTime(
+            &global_store_total_ms,
+            global_store_start,
+            global_store_stop
+        )
+    );
+
+    float global_store_avg_ms =
+        global_store_total_ms / benchmark_runs;
+
+    double global_store_gflops =
+        flops / (global_store_avg_ms / 1000.0) / 1e9;
+
+    cout << "V6 average latency = "
+        << global_store_avg_ms << " ms" << endl;
+
+    cout << "V6 GFLOPS = "
+        << global_store_gflops << endl;
+
+    double global_store_shared_store_speedup =
+        global_store_gflops / shared_store_gflops;
+
+    cout << "V6 / V5 speedup = "
+        << global_store_shared_store_speedup << endl;
 
     cout<<endl;
 
@@ -1260,6 +1491,12 @@ int main(){
     cout << "V5 GFLOPS / cuBLAS GFLOPS = "
         << shared_store_cublas_percentage << " %" << endl;
 
+    double global_store_cublas_percentage =
+        global_store_gflops / cublas_gflops * 100.0;
+
+    cout << "V6 GFLOPS / cuBLAS GFLOPS = "
+        << global_store_cublas_percentage << " %" << endl;
+
 /******************************************************************************** */
 
     //D2H
@@ -1301,6 +1538,13 @@ int main(){
     CHECK_CUDA(cudaMemcpy(
         h_shared_store_C.data(),
         d_C_shared_store,
+        C_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    CHECK_CUDA(cudaMemcpy(
+        h_global_store_C.data(),
+        d_C_global_store,
         C_bytes,
         cudaMemcpyDeviceToHost
     ));
@@ -1444,6 +1688,28 @@ int main(){
 
     cout<<endl;
 
+    //V6正确性检验（1024 x 1024 x 1024）
+    float global_store_max_abs_error = 0.0f;
+
+    for (int i = 0; i < M * N; i++) {
+        float error =
+            fabsf(h_cpu_C[i] - h_global_store_C[i]);
+
+        global_store_max_abs_error =
+            max(global_store_max_abs_error, error);
+    }
+
+    cout << "V6 (1024 x 1024 x 1024) max absolute error = "
+        << global_store_max_abs_error << endl;
+
+    if (global_store_max_abs_error < 1e-5f) {
+        cout << "V6 (1024 x 1024 x 1024): Correct!" << endl;
+    } else {
+        cout << "V6 (1024 x 1024 x 1024): Mismatch!" << endl;
+    }
+
+    cout<<endl;
+
     //V5边界正确性检验（130 x 129 x 137）
     const int boundary_M = 130;
     const int boundary_N = 129;
@@ -1453,6 +1719,7 @@ int main(){
     vector<float> h_boundary_B(boundary_K * boundary_N);
     vector<float> h_boundary_cpu_C(boundary_M * boundary_N);
     vector<float> h_boundary_v5_C(boundary_M * boundary_N);
+    vector<float> h_boundary_v6_C(boundary_M * boundary_N);
 
     for (int i = 0; i < boundary_M * boundary_K; ++i) {
         h_boundary_A[i] = static_cast<float>((i % 17) - 8) / 10.0f;
@@ -1474,6 +1741,7 @@ int main(){
     float* d_boundary_A = nullptr;
     float* d_boundary_B = nullptr;
     float* d_boundary_v5_C = nullptr;
+    float* d_boundary_v6_C = nullptr;
 
     size_t boundary_A_bytes =
         static_cast<size_t>(boundary_M) * boundary_K * sizeof(float);
@@ -1485,6 +1753,7 @@ int main(){
     CHECK_CUDA(cudaMalloc(&d_boundary_A, boundary_A_bytes));
     CHECK_CUDA(cudaMalloc(&d_boundary_B, boundary_B_bytes));
     CHECK_CUDA(cudaMalloc(&d_boundary_v5_C, boundary_C_bytes));
+    CHECK_CUDA(cudaMalloc(&d_boundary_v6_C, boundary_C_bytes));
 
     CHECK_CUDA(cudaMemcpy(
         d_boundary_A,
@@ -1504,7 +1773,7 @@ int main(){
         (boundary_M + BM_V5 - 1) / BM_V5
     );
 
-    gemm2DThreadTiledVectorizedSharedStore_v1<<<
+    gemm2DThreadTiledVectorizedSharedStore<<<
         boundary_grid_v5,
         block_v5
     >>>(
@@ -1547,9 +1816,58 @@ int main(){
 
     cout<<endl;
 
+    dim3 boundary_grid_v6(
+        (boundary_N + BN_V6 - 1) / BN_V6,
+        (boundary_M + BM_V6 - 1) / BM_V6
+    );
+
+    gemm2DThreadTiledVectorizedGlobalStore<<<
+        boundary_grid_v6,
+        block_v6
+    >>>(
+        d_boundary_A,
+        d_boundary_B,
+        d_boundary_v6_C,
+        boundary_M,
+        boundary_N,
+        boundary_K
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CHECK_CUDA(cudaMemcpy(
+        h_boundary_v6_C.data(),
+        d_boundary_v6_C,
+        boundary_C_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    float boundary_v6_max_abs_error = 0.0f;
+
+    for (int i = 0; i < boundary_M * boundary_N; ++i) {
+        float error =
+            fabsf(h_boundary_cpu_C[i] - h_boundary_v6_C[i]);
+
+        boundary_v6_max_abs_error =
+            max(boundary_v6_max_abs_error, error);
+    }
+
+    cout << "V6 (130 x 129 x 137) max absolute error = "
+        << boundary_v6_max_abs_error << endl;
+
+    if (boundary_v6_max_abs_error < 1e-5f) {
+        cout << "V6 (130 x 129 x 137): Correct!" << endl;
+    } else {
+        cout << "V6 (130 x 129 x 137): Mismatch!" << endl;
+    }
+
+    cout<<endl;
+
     CHECK_CUDA(cudaFree(d_boundary_A));
     CHECK_CUDA(cudaFree(d_boundary_B));
     CHECK_CUDA(cudaFree(d_boundary_v5_C));
+    CHECK_CUDA(cudaFree(d_boundary_v6_C));
     
     //cuBLAS正确性检验
     float cublas_max_abs_error = 0.0f;
@@ -1581,6 +1899,7 @@ int main(){
     CHECK_CUDA(cudaFree(d_C_2d_thread_tiled));
     CHECK_CUDA(cudaFree(d_C_vectorized));
     CHECK_CUDA(cudaFree(d_C_shared_store));
+    CHECK_CUDA(cudaFree(d_C_global_store));
     CHECK_CUDA(cudaFree(d_C_cublas));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
@@ -1594,6 +1913,8 @@ int main(){
     CHECK_CUDA(cudaEventDestroy(vectorized_stop));
     CHECK_CUDA(cudaEventDestroy(shared_store_start));
     CHECK_CUDA(cudaEventDestroy(shared_store_stop));
+    CHECK_CUDA(cudaEventDestroy(global_store_start));
+    CHECK_CUDA(cudaEventDestroy(global_store_stop));
     CHECK_CUDA(cudaEventDestroy(cublas_start));
     CHECK_CUDA(cudaEventDestroy(cublas_stop));
     CHECK_CUBLAS(cublasDestroy(handle));
