@@ -953,6 +953,322 @@ __global__ void gemm2DThreadTiledDoubleBuffered(
     }
 }
 
+//V7_2
+__global__ void gemm2DThreadTiledDoubleBufferedRegisterPrefetch(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int tid = ty * blockDim.x + tx;//thread 在 block 内线性编号
+
+    __shared__ __align__(16) float As[2][BM_V7][BK_V7];
+    __shared__ __align__(16) float Bs[2][BK_V7][BN_V7];
+
+    float sum[TM_V7][TN_V7] = {0.0f};
+
+    //local_row/local_col → 访问 Shared Memory
+    int local_row = ty * TM_V7;
+    int local_col = tx * TN_V7;
+
+    //C Tile中左上角数据坐标
+    //global_row/global_col → 写 Global C
+    int global_row = blockIdx.y * BM_V7 + local_row;
+    int global_col = blockIdx.x * BN_V7 + local_col;
+
+    // ========================
+    // Outer Prologue
+    // ========================
+    int num_tiles = (K + BK_V7 - 1) / BK_V7;
+
+    //A -> As
+    int a_vecs_per_row = BK_V7 / VEC_V7;
+
+    int row_As = tid / a_vecs_per_row;
+    int col_As = (tid % a_vecs_per_row) * VEC_V7;
+
+    int row_A = blockIdx.y * BM_V7 + row_As;
+    int col_A = 0 * BK_V7 + col_As;
+
+    int linear_idx_A = row_A * K + col_A;
+
+    if(row_A < M && col_A + VEC_V7 - 1 < K && linear_idx_A % VEC_V7 == 0){
+        float4 vec = *reinterpret_cast<const float4*>(&A[linear_idx_A]);
+
+        *reinterpret_cast<float4*>(&As[0][row_As][col_As]) = vec;
+    }else{
+        for(int i = 0; i < VEC_V7; i++){
+            int current_col_A = col_A + i;
+
+            if(row_A < M && current_col_A < K){
+                As[0][row_As][col_As + i] = A[linear_idx_A + i];
+            }else{
+                As[0][row_As][col_As + i] = 0.0f;
+            }
+        } 
+    }
+
+    //B -> Bs
+    int b_vecs_per_row = BN_V7 / VEC_V7;
+
+    int row_Bs = tid / b_vecs_per_row;
+    int col_Bs = (tid % b_vecs_per_row) * VEC_V7;
+
+    int row_B = 0 * BK_V7 + row_Bs;
+    int col_B = blockIdx.x * BN_V7 + col_Bs;
+
+    int linear_idx_B = row_B * N + col_B;
+
+    if(row_B < K && col_B + VEC_V7 - 1 < N && linear_idx_B % VEC_V7 == 0){
+        float4 vec = *reinterpret_cast<const float4*>(&B[linear_idx_B]);
+
+        *reinterpret_cast<float4*>(&Bs[0][row_Bs][col_Bs]) = vec;
+    }else{
+        for(int i = 0; i < VEC_V7; i++){
+            int current_col_B = col_B + i;
+
+            if(row_B < K && current_col_B < N){
+                Bs[0][row_Bs][col_Bs + i] = B[linear_idx_B + i];
+            }else{
+                Bs[0][row_Bs][col_Bs + i] = 0.0f;
+            }
+        } 
+    }   
+
+    
+    int cur = 0;
+    int next = 1;
+
+    __syncthreads();
+
+    // ========================
+    // Outer Steady State
+    // ========================
+
+    for(int tile = 0; tile < num_tiles - 1; tile++){
+        float4 next_A = make_float4(0.f, 0.f, 0.f, 0.f);
+        float4 next_B = make_float4(0.f, 0.f, 0.f, 0.f);
+
+        //next_A, Global→Register ,prefetch
+        int next_row_A = row_A;
+        int next_col_A = (tile + 1) * BK_V7 + col_As;
+        int next_linear_idx_A = next_row_A * K + next_col_A;
+
+        if(next_row_A < M && next_col_A + VEC_V7 - 1 < K && next_linear_idx_A % VEC_V7 == 0){
+            next_A = *reinterpret_cast<const float4*>(&A[next_linear_idx_A]);
+        }else if(next_row_A < M){
+            if (next_col_A + 0 < K)
+                next_A.x = A[next_linear_idx_A + 0];
+
+            if (next_col_A + 1 < K)
+                next_A.y = A[next_linear_idx_A + 1];
+
+            if (next_col_A + 2 < K)
+                next_A.z = A[next_linear_idx_A + 2];
+
+            if (next_col_A + 3 < K)
+                next_A.w = A[next_linear_idx_A + 3];
+        }
+
+        //next_B, Global→Register ,prefetch
+        int next_row_B = (tile + 1) * BK_V7 + row_Bs;
+        int next_col_B = col_B;
+        int next_linear_idx_B = next_row_B * N + next_col_B;
+
+        if(next_row_B < K && next_col_B + VEC_V7 - 1 < N && next_linear_idx_B % VEC_V7 == 0){
+            next_B = *reinterpret_cast<const float4*>(&B[next_linear_idx_B]);
+        }else if(next_row_B < K){
+            if (next_col_B + 0 < N)
+                next_B.x = B[next_linear_idx_B + 0];
+
+            if (next_col_B + 1 < N)
+                next_B.y = B[next_linear_idx_B + 1];
+
+            if (next_col_B + 2 < N)
+                next_B.z = B[next_linear_idx_B + 2];
+
+            if (next_col_B + 3 < N)
+                next_B.w = B[next_linear_idx_B + 3];
+        }
+        
+        
+        // cur compute - register double buffering
+        float reg_A0[TM_V7];
+        float reg_B0[TN_V7];
+
+        float reg_A1[TM_V7];
+        float reg_B1[TN_V7];
+
+        // Inner Prologue - load k0 -> Buffer0;
+        //As -> reg_A
+        for(int i = 0; i < TM_V7; i++){
+            reg_A0[i] = As[cur][local_row + i][0];
+        }
+        //Bs -> reg_B
+        for(int i = 0; i < TN_V7; i++){
+            reg_B0[i] = Bs[cur][0][local_col + i];
+        }
+
+        //Inner Steady State
+        #pragma unroll
+        for(int k = 0; k < BK_V7 - 1; k += 2){
+            // prefetch k+1 -> Buffer1
+            //As -> reg_A
+            for(int i = 0; i < TM_V7; i++){
+                reg_A1[i] = As[cur][local_row + i][k + 1];
+            }
+            //Bs -> reg_B
+            for(int i = 0; i < TN_V7; i++){
+                reg_B1[i] = Bs[cur][k + 1][local_col + i];
+            }
+
+            // compute k using Buffer0
+            for(int i = 0; i < TM_V7; i++){
+                for(int j = 0; j < TN_V7; j++){
+                    sum[i][j] += reg_A0[i] * reg_B0[j];
+                }
+            }
+
+            if(k + 2 < BK_V7){
+            // prefetch k+2 -> Buffer0
+                for(int i = 0; i < TM_V7; i++){
+                    reg_A0[i] = As[cur][local_row + i][k + 2];
+                }
+                //Bs -> reg_B
+                for(int i = 0; i < TN_V7; i++){
+                    reg_B0[i] = Bs[cur][k + 2][local_col + i];
+                }
+            }
+
+            // compute k+1 using Buffer1
+            for(int i = 0; i < TM_V7; i++){
+                for(int j = 0; j < TN_V7; j++){
+                    sum[i][j] += reg_A1[i] * reg_B1[j];
+                }
+            }          
+        }
+
+        //Inner Epilogue - handle odd BK
+        if (BK_V7 % 2 != 0) {
+            for(int i = 0; i < TM_V7; i++){
+                for(int j = 0; j < TN_V7; j++){
+                    sum[i][j] += reg_A0[i] * reg_B0[j];
+                }
+            }           
+        }
+
+        //next_A / next_B registers -> Shared[next]
+        *reinterpret_cast<float4*>(&As[next][row_As][col_As]) = next_A;
+        *reinterpret_cast<float4*>(&Bs[next][row_Bs][col_Bs]) = next_B;
+
+        __syncthreads();
+
+        // swap buffer
+        cur ^= 1;
+        next ^= 1;
+    }
+
+    // ========================
+    // Outer Epilogue
+    // ========================
+    float reg_A0[TM_V7];
+    float reg_B0[TN_V7];
+
+    float reg_A1[TM_V7];
+    float reg_B1[TN_V7];
+
+    // Inner Prologue - load k0 -> Buffer0;
+    //As -> reg_A
+    for(int i = 0; i < TM_V7; i++){
+        reg_A0[i] = As[cur][local_row + i][0];
+    }
+    //Bs -> reg_B
+    for(int i = 0; i < TN_V7; i++){
+        reg_B0[i] = Bs[cur][0][local_col + i];
+    }
+
+    //Inner Steady State
+    #pragma unroll
+    for(int k = 0; k < BK_V7 - 1; k += 2){
+        // prefetch k+1 -> Buffer1
+        //As -> reg_A
+        for(int i = 0; i < TM_V7; i++){
+            reg_A1[i] = As[cur][local_row + i][k + 1];
+        }
+        //Bs -> reg_B
+        for(int i = 0; i < TN_V7; i++){
+            reg_B1[i] = Bs[cur][k + 1][local_col + i];
+        }
+
+        // compute k using Buffer0
+        for(int i = 0; i < TM_V7; i++){
+            for(int j = 0; j < TN_V7; j++){
+                sum[i][j] += reg_A0[i] * reg_B0[j];
+            }
+        }
+
+        if(k + 2 < BK_V7){
+        // prefetch k+2 -> Buffer0
+            for(int i = 0; i < TM_V7; i++){
+                reg_A0[i] = As[cur][local_row + i][k + 2];
+            }
+            //Bs -> reg_B
+            for(int i = 0; i < TN_V7; i++){
+                reg_B0[i] = Bs[cur][k + 2][local_col + i];
+            }
+        }
+
+        // compute k+1 using Buffer1
+        for(int i = 0; i < TM_V7; i++){
+            for(int j = 0; j < TN_V7; j++){
+                sum[i][j] += reg_A1[i] * reg_B1[j];
+            }
+        }          
+    }
+
+    //Inner Epilogue - handle odd BK
+    if (BK_V7 % 2 != 0) {
+        for(int i = 0; i < TM_V7; i++){
+            for(int j = 0; j < TN_V7; j++){
+                sum[i][j] += reg_A0[i] * reg_B0[j];
+            }
+        }           
+    }
+
+    // ========================
+    // C Store
+    // ========================
+    for(int i = 0; i < TM_V7; i++){
+        //确定C的行
+        int row_C = global_row + i;
+        int linear_idx_C = row_C * N + global_col;
+
+        if(row_C < M && global_col + VEC_V7 - 1 < N && linear_idx_C % VEC_V7 == 0){//没超出边界、符合16 byte对齐，进入fast path
+            float4 out = make_float4(
+                sum[i][0],
+                sum[i][1],
+                sum[i][2],
+                sum[i][3]
+            );
+    
+            *reinterpret_cast<float4*>(&C[linear_idx_C]) = out;
+        }else{
+            for(int j = 0; j < TN_V7; j++){
+                int col_C = global_col + j;
+
+                if(row_C < M && col_C < N){
+                    C[row_C * N + col_C] = sum[i][j];
+                }
+            }
+        }
+    }
+}
+
 //CPU Reference
 void gemmCPU(
     const float* A,
@@ -983,6 +1299,7 @@ void runV7ControlFlowCorrectnessTest(
     vector<float> h_B(K * N);
     vector<float> h_cpu_C(M * N);
     vector<float> h_v7_C(M * N);
+    vector<float> h_v7_2_C(M * N);
 
     for (int i = 0; i < M * K; ++i) {
         h_A[i] = static_cast<float>((i % 17) - 8) / 10.0f;
@@ -1004,6 +1321,7 @@ void runV7ControlFlowCorrectnessTest(
     float* d_A = nullptr;
     float* d_B = nullptr;
     float* d_C = nullptr;
+    float* d_C_v7_2 = nullptr;
 
     size_t A_bytes = static_cast<size_t>(M) * K * sizeof(float);
     size_t B_bytes = static_cast<size_t>(K) * N * sizeof(float);
@@ -1012,6 +1330,7 @@ void runV7ControlFlowCorrectnessTest(
     CHECK_CUDA(cudaMalloc(&d_A, A_bytes));
     CHECK_CUDA(cudaMalloc(&d_B, B_bytes));
     CHECK_CUDA(cudaMalloc(&d_C, C_bytes));
+    CHECK_CUDA(cudaMalloc(&d_C_v7_2, C_bytes));
 
     CHECK_CUDA(cudaMemcpy(
         d_A,
@@ -1048,9 +1367,28 @@ void runV7ControlFlowCorrectnessTest(
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
 
+    gemm2DThreadTiledDoubleBufferedRegisterPrefetch<<<grid_v7, block_v7>>>(
+        d_A,
+        d_B,
+        d_C_v7_2,
+        M,
+        N,
+        K
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
     CHECK_CUDA(cudaMemcpy(
         h_v7_C.data(),
         d_C,
+        C_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    CHECK_CUDA(cudaMemcpy(
+        h_v7_2_C.data(),
+        d_C_v7_2,
         C_bytes,
         cudaMemcpyDeviceToHost
     ));
@@ -1076,16 +1414,37 @@ void runV7ControlFlowCorrectnessTest(
         << max_abs_error << endl;
 
     if (max_abs_error < 1e-5f) {
-        cout << "Correct!" << endl;
+        cout << "V7: Correct!" << endl;
     } else {
-        cout << "Mismatch!" << endl;
+        cout << "V7: Mismatch!" << endl;
     }
 
     cout<<endl;
 
+    float v7_2_max_abs_error = 0.0f;
+
+    for (int i = 0; i < M * N; ++i) {
+        float error =
+            fabsf(h_cpu_C[i] - h_v7_2_C[i]);
+
+        v7_2_max_abs_error =
+            max(v7_2_max_abs_error, error);
+    }
+
+    cout << "V7_2 max absolute error = "
+        << v7_2_max_abs_error << endl;
+
+    if (v7_2_max_abs_error < 1e-5f) {
+        cout << "V7_2: Correct!" << endl;
+    } else {
+        cout << "V7_2: Mismatch!" << endl;
+    }
+
+    cout<<endl;
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
     CHECK_CUDA(cudaFree(d_C));
+    CHECK_CUDA(cudaFree(d_C_v7_2));
 }
 
 int main(){
@@ -1162,6 +1521,15 @@ int main(){
         (M + BM_V7 - 1) / BM_V7
     );
 
+    dim3 block_v7_2(
+        BN_V7 / TN_V7,
+        BM_V7 / TM_V7
+    );
+    dim3 grid_v7_2(
+        (N + BN_V7 - 1) / BN_V7,
+        (M + BM_V7 - 1) / BM_V7
+    );
+
     //准备Host数据
     vector<float> h_A(M * K);
     vector<float> h_B(K * N);
@@ -1183,6 +1551,7 @@ int main(){
     vector<float> h_shared_store_C(M * N);
     vector<float> h_global_store_C(M * N);
     vector<float> h_double_buffered_C(M * N);
+    vector<float> h_register_prefetch_C(M * N);
     vector<float> h_cublas_C(M * N);
 
     //CPU Reference
@@ -1199,6 +1568,7 @@ int main(){
     float* d_C_shared_store = nullptr;
     float* d_C_global_store = nullptr;
     float* d_C_double_buffered = nullptr;
+    float* d_C_register_prefetch = nullptr;
     float* d_C_cublas = nullptr;
 
     size_t A_bytes = static_cast<size_t>(M) * K * sizeof(float);
@@ -1215,6 +1585,7 @@ int main(){
     CHECK_CUDA(cudaMalloc(&d_C_shared_store, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_global_store, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_double_buffered, C_bytes));
+    CHECK_CUDA(cudaMalloc(&d_C_register_prefetch, C_bytes));
     CHECK_CUDA(cudaMalloc(&d_C_cublas, C_bytes));
 
     //H2D
@@ -1808,6 +2179,75 @@ int main(){
 
 /************************************************************************************ */
 
+    //V7_2 Register Prefetch warm up
+    for(int i = 0; i < warmup_runs; ++i) {
+        gemm2DThreadTiledDoubleBufferedRegisterPrefetch<<<grid_v7_2, block_v7_2>>>(
+            d_A,
+            d_B,
+            d_C_register_prefetch,
+            M,
+            N,
+            K
+        );
+    }
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t register_prefetch_start, register_prefetch_stop;
+
+    CHECK_CUDA(cudaEventCreate(&register_prefetch_start));
+    CHECK_CUDA(cudaEventCreate(&register_prefetch_stop));
+
+    CHECK_CUDA(cudaEventRecord(register_prefetch_start));
+
+    for (int i = 0; i < benchmark_runs; ++i) {
+        gemm2DThreadTiledDoubleBufferedRegisterPrefetch<<<grid_v7_2, block_v7_2>>>(
+            d_A,
+            d_B,
+            d_C_register_prefetch,
+            M,
+            N,
+            K
+        );
+    }
+
+    CHECK_CUDA(cudaEventRecord(register_prefetch_stop));
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventSynchronize(register_prefetch_stop));
+
+    float register_prefetch_total_ms = 0.0f;
+
+    CHECK_CUDA(
+        cudaEventElapsedTime(
+            &register_prefetch_total_ms,
+            register_prefetch_start,
+            register_prefetch_stop
+        )
+    );
+
+    float register_prefetch_avg_ms =
+        register_prefetch_total_ms / benchmark_runs;
+
+    double register_prefetch_gflops =
+        flops / (register_prefetch_avg_ms / 1000.0) / 1e9;
+
+    cout << "V7_2 average latency = "
+        << register_prefetch_avg_ms << " ms" << endl;
+
+    cout << "V7_2 GFLOPS = "
+        << register_prefetch_gflops << endl;
+
+    double register_prefetch_double_buffered_speedup =
+        register_prefetch_gflops / double_buffered_gflops;
+
+    cout << "V7_2 / V7 speedup = "
+        << register_prefetch_double_buffered_speedup << endl;
+
+    cout<<endl;
+
+/************************************************************************************ */
+
     //创建 cuBLAS handle，执行cuBLAS内的工业级GEMM，以此为参照
     cublasHandle_t handle;
 
@@ -1934,6 +2374,12 @@ int main(){
     cout << "V7 GFLOPS / cuBLAS GFLOPS = "
         << double_buffered_cublas_percentage << " %" << endl;
 
+    double register_prefetch_cublas_percentage =
+        register_prefetch_gflops / cublas_gflops * 100.0;
+
+    cout << "V7_2 GFLOPS / cuBLAS GFLOPS = "
+        << register_prefetch_cublas_percentage << " %" << endl;
+
 /******************************************************************************** */
 
     //D2H
@@ -1989,6 +2435,13 @@ int main(){
     CHECK_CUDA(cudaMemcpy(
         h_double_buffered_C.data(),
         d_C_double_buffered,
+        C_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    CHECK_CUDA(cudaMemcpy(
+        h_register_prefetch_C.data(),
+        d_C_register_prefetch,
         C_bytes,
         cudaMemcpyDeviceToHost
     ));
@@ -2176,6 +2629,28 @@ int main(){
 
     cout<<endl;
 
+    //V7_2正确性检验（1024 x 1024 x 1024）
+    float register_prefetch_max_abs_error = 0.0f;
+
+    for (int i = 0; i < M * N; i++) {
+        float error =
+            fabsf(h_cpu_C[i] - h_register_prefetch_C[i]);
+
+        register_prefetch_max_abs_error =
+            max(register_prefetch_max_abs_error, error);
+    }
+
+    cout << "V7_2 (1024 x 1024 x 1024) max absolute error = "
+        << register_prefetch_max_abs_error << endl;
+
+    if (register_prefetch_max_abs_error < 1e-5f) {
+        cout << "V7_2 (1024 x 1024 x 1024): Correct!" << endl;
+    } else {
+        cout << "V7_2 (1024 x 1024 x 1024): Mismatch!" << endl;
+    }
+
+    cout<<endl;
+
     //V5边界正确性检验（130 x 129 x 137）
     const int boundary_M = 130;
     const int boundary_N = 129;
@@ -2187,6 +2662,7 @@ int main(){
     vector<float> h_boundary_v5_C(boundary_M * boundary_N);
     vector<float> h_boundary_v6_C(boundary_M * boundary_N);
     vector<float> h_boundary_v7_C(boundary_M * boundary_N);
+    vector<float> h_boundary_v7_2_C(boundary_M * boundary_N);
 
     for (int i = 0; i < boundary_M * boundary_K; ++i) {
         h_boundary_A[i] = static_cast<float>((i % 17) - 8) / 10.0f;
@@ -2210,6 +2686,7 @@ int main(){
     float* d_boundary_v5_C = nullptr;
     float* d_boundary_v6_C = nullptr;
     float* d_boundary_v7_C = nullptr;
+    float* d_boundary_v7_2_C = nullptr;
 
     size_t boundary_A_bytes =
         static_cast<size_t>(boundary_M) * boundary_K * sizeof(float);
@@ -2223,6 +2700,7 @@ int main(){
     CHECK_CUDA(cudaMalloc(&d_boundary_v5_C, boundary_C_bytes));
     CHECK_CUDA(cudaMalloc(&d_boundary_v6_C, boundary_C_bytes));
     CHECK_CUDA(cudaMalloc(&d_boundary_v7_C, boundary_C_bytes));
+    CHECK_CUDA(cudaMalloc(&d_boundary_v7_2_C, boundary_C_bytes));
 
     CHECK_CUDA(cudaMemcpy(
         d_boundary_A,
@@ -2381,13 +2859,62 @@ int main(){
 
     cout<<endl;
 
+    dim3 boundary_grid_v7_2(
+        (boundary_N + BN_V7 - 1) / BN_V7,
+        (boundary_M + BM_V7 - 1) / BM_V7
+    );
+
+    gemm2DThreadTiledDoubleBufferedRegisterPrefetch<<<
+        boundary_grid_v7_2,
+        block_v7_2
+    >>>(
+        d_boundary_A,
+        d_boundary_B,
+        d_boundary_v7_2_C,
+        boundary_M,
+        boundary_N,
+        boundary_K
+    );
+
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    CHECK_CUDA(cudaMemcpy(
+        h_boundary_v7_2_C.data(),
+        d_boundary_v7_2_C,
+        boundary_C_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+
+    float boundary_v7_2_max_abs_error = 0.0f;
+
+    for (int i = 0; i < boundary_M * boundary_N; ++i) {
+        float error =
+            fabsf(h_boundary_cpu_C[i] - h_boundary_v7_2_C[i]);
+
+        boundary_v7_2_max_abs_error =
+            max(boundary_v7_2_max_abs_error, error);
+    }
+
+    cout << "V7_2 (130 x 129 x 137) max absolute error = "
+        << boundary_v7_2_max_abs_error << endl;
+
+    if (boundary_v7_2_max_abs_error < 1e-5f) {
+        cout << "V7_2 (130 x 129 x 137): Correct!" << endl;
+    } else {
+        cout << "V7_2 (130 x 129 x 137): Mismatch!" << endl;
+    }
+
+    cout<<endl;
+
     CHECK_CUDA(cudaFree(d_boundary_A));
     CHECK_CUDA(cudaFree(d_boundary_B));
     CHECK_CUDA(cudaFree(d_boundary_v5_C));
     CHECK_CUDA(cudaFree(d_boundary_v6_C));
     CHECK_CUDA(cudaFree(d_boundary_v7_C));
+    CHECK_CUDA(cudaFree(d_boundary_v7_2_C));
 
-    cout << "V7 control-flow correctness tests" << endl;
+    cout << "V7 and V7_2 control-flow correctness tests" << endl;
     cout<<endl;
 
     runV7ControlFlowCorrectnessTest(1, 64, 64, 16);
@@ -2426,6 +2953,7 @@ int main(){
     CHECK_CUDA(cudaFree(d_C_shared_store));
     CHECK_CUDA(cudaFree(d_C_global_store));
     CHECK_CUDA(cudaFree(d_C_double_buffered));
+    CHECK_CUDA(cudaFree(d_C_register_prefetch));
     CHECK_CUDA(cudaFree(d_C_cublas));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
@@ -2443,6 +2971,8 @@ int main(){
     CHECK_CUDA(cudaEventDestroy(global_store_stop));
     CHECK_CUDA(cudaEventDestroy(double_buffered_start));
     CHECK_CUDA(cudaEventDestroy(double_buffered_stop));
+    CHECK_CUDA(cudaEventDestroy(register_prefetch_start));
+    CHECK_CUDA(cudaEventDestroy(register_prefetch_stop));
     CHECK_CUDA(cudaEventDestroy(cublas_start));
     CHECK_CUDA(cudaEventDestroy(cublas_stop));
     CHECK_CUBLAS(cublasDestroy(handle));
