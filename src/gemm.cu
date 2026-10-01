@@ -64,6 +64,15 @@ constexpr int TM_V7  = TM_V6;
 constexpr int TN_V7  = TN_V6;
 constexpr int VEC_V7 = VEC_V6;
 
+constexpr int BM_V8 = 64;
+constexpr int BN_V8 = 64;
+constexpr int BK_V8 = 16;
+constexpr int WM_V8 = 16;
+constexpr int WN_V8 = 32;
+constexpr int TM_V8 = 4;
+constexpr int TN_V8 = 4;
+constexpr int VEC_V8 = 4;
+
 //V0
 __global__ void gemmNaive(
     const float* A,
@@ -1269,6 +1278,500 @@ __global__ void gemm2DThreadTiledDoubleBufferedRegisterPrefetch(
     }
 }
 
+
+// Block 内 warp tile 的排布
+constexpr int WARPS_M_V8 = BM_V8 / WM_V8; // 4
+constexpr int WARPS_N_V8 = BN_V8 / WN_V8; // 2
+
+// Warp 内 thread tile 的排布
+constexpr int LANES_M_V8 = WM_V8 / TM_V8; // 4
+constexpr int LANES_N_V8 = WN_V8 / TN_V8; // 8
+
+constexpr int THREADS_V8 = WARPS_M_V8 * WARPS_N_V8 * 32; // 256
+//V8_1
+__global__ void gemmWarpTiledDoubleBufferedV8_1(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int tid = ty * blockDim.x + tx;//thread 在 block 内线性编号
+
+    //计算warp id和lane id
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    // Warp tile 在 Block tile 中的坐标
+    int warp_row = warp_id / WARPS_N_V8;
+    int warp_col = warp_id % WARPS_N_V8;
+
+    // Thread tile 在 Warp tile 中的坐标
+    int lane_row = lane_id / LANES_N_V8;
+    int lane_col = lane_id % LANES_N_V8;
+
+    __shared__ __align__(16) float As[2][BM_V8][BK_V8];
+    __shared__ __align__(16) float Bs[2][BK_V8][BN_V8];
+
+    float sum[TM_V8][TN_V8] = {0.0f};
+
+    // 当前线程负责的 C 微块在 Block tile 内的起点
+    int local_row = warp_row * WM_V8 + lane_row * TM_V8;
+    int local_col = warp_col * WN_V8 + lane_col * TN_V8;
+
+    // 当前线程负责的 C 微块在完整矩阵中的起点
+    int global_row = blockIdx.y * BM_V8 + local_row;
+    int global_col = blockIdx.x * BN_V8 + local_col;
+
+    // ========================
+    // Prologue
+    // ========================
+    int num_tiles = (K + BK_V8 - 1) / BK_V8;
+
+    //A -> As
+    int a_vecs_per_row = BK_V8 / VEC_V8;
+
+    int row_As = tid / a_vecs_per_row;
+    int col_As = (tid % a_vecs_per_row) * VEC_V8;
+
+    int row_A = blockIdx.y * BM_V8 + row_As;
+    int col_A = 0 * BK_V8 + col_As;
+
+    int linear_idx_A = row_A * K + col_A;
+
+    if(row_A < M && col_A + VEC_V8 - 1 < K && linear_idx_A % VEC_V8 == 0){
+        float4 vec = *reinterpret_cast<const float4*>(&A[linear_idx_A]);
+
+        *reinterpret_cast<float4*>(&As[0][row_As][col_As]) = vec;
+    }else{
+        for(int i = 0; i < VEC_V8; i++){
+            int current_col_A = col_A + i;
+
+            if(row_A < M && current_col_A < K){
+                As[0][row_As][col_As + i] = A[linear_idx_A + i];
+            }else{
+                As[0][row_As][col_As + i] = 0.0f;
+            }
+        }
+    }
+
+    //B -> Bs
+    int b_vecs_per_row = BN_V8 / VEC_V8;
+
+    int row_Bs = tid / b_vecs_per_row;
+    int col_Bs = (tid % b_vecs_per_row) * VEC_V8;
+
+    int row_B = 0 * BK_V8 + row_Bs;
+    int col_B = blockIdx.x * BN_V8 + col_Bs;
+
+    int linear_idx_B = row_B * N + col_B;
+
+    if(row_B < K && col_B + VEC_V8 - 1 < N && linear_idx_B % VEC_V8 == 0){
+        float4 vec = *reinterpret_cast<const float4*>(&B[linear_idx_B]);
+
+        *reinterpret_cast<float4*>(&Bs[0][row_Bs][col_Bs]) = vec;
+    }else{
+        for(int i = 0; i < VEC_V8; i++){
+            int current_col_B = col_B + i;
+
+            if(row_B < K && current_col_B < N){
+                Bs[0][row_Bs][col_Bs + i] = B[linear_idx_B + i];
+            }else{
+                Bs[0][row_Bs][col_Bs + i] = 0.0f;
+            }
+        }
+    }
+
+
+    int cur = 0;
+    int next = 1;
+
+    __syncthreads();
+
+    // ========================
+    // Steady State
+    // ========================
+
+    for(int tile = 0; tile < num_tiles - 1; tile++){
+        float4 next_A = make_float4(0.f, 0.f, 0.f, 0.f);
+        float4 next_B = make_float4(0.f, 0.f, 0.f, 0.f);
+
+        //next_A, Global→Register ,prefetch
+        int next_row_A = row_A;
+        int next_col_A = (tile + 1) * BK_V8 + col_As;
+        int next_linear_idx_A = next_row_A * K + next_col_A;
+
+        if(next_row_A < M && next_col_A + VEC_V8 - 1 < K && next_linear_idx_A % VEC_V8 == 0){
+            next_A = *reinterpret_cast<const float4*>(&A[next_linear_idx_A]);
+        }else if(next_row_A < M){
+            if (next_col_A + 0 < K)
+                next_A.x = A[next_linear_idx_A + 0];
+
+            if (next_col_A + 1 < K)
+                next_A.y = A[next_linear_idx_A + 1];
+
+            if (next_col_A + 2 < K)
+                next_A.z = A[next_linear_idx_A + 2];
+
+            if (next_col_A + 3 < K)
+                next_A.w = A[next_linear_idx_A + 3];
+        }
+
+        //next_B, Global→Register ,prefetch
+        int next_row_B = (tile + 1) * BK_V8 + row_Bs;
+        int next_col_B = col_B;
+        int next_linear_idx_B = next_row_B * N + next_col_B;
+
+        if(next_row_B < K && next_col_B + VEC_V8 - 1 < N && next_linear_idx_B % VEC_V8 == 0){
+            next_B = *reinterpret_cast<const float4*>(&B[next_linear_idx_B]);
+        }else if(next_row_B < K){
+            if (next_col_B + 0 < N)
+                next_B.x = B[next_linear_idx_B + 0];
+
+            if (next_col_B + 1 < N)
+                next_B.y = B[next_linear_idx_B + 1];
+
+            if (next_col_B + 2 < N)
+                next_B.z = B[next_linear_idx_B + 2];
+
+            if (next_col_B + 3 < N)
+                next_B.w = B[next_linear_idx_B + 3];
+        }
+
+        //cur compute
+        for(int k = 0; k < BK_V8; k++){
+            float reg_A[TM_V8];
+            float reg_B[TN_V8];
+            //As -> reg_A
+            for(int i = 0; i < TM_V8; i++){
+                reg_A[i] = As[cur][local_row + i][k];
+            }
+            //Bs -> reg_B
+            for(int i = 0; i < TN_V8; i++){
+                reg_B[i] = Bs[cur][k][local_col + i];
+            }
+            //计算sum
+            for(int i = 0; i < TM_V8; i++){
+                for(int j = 0; j < TN_V8; j++){
+                    sum[i][j] += reg_A[i] * reg_B[j];
+                }
+            }
+        }
+
+        //next_A / next_B registers -> Shared[next]
+        *reinterpret_cast<float4*>(&As[next][row_As][col_As]) = next_A;
+        *reinterpret_cast<float4*>(&Bs[next][row_Bs][col_Bs]) = next_B;
+
+        __syncthreads();
+
+        // swap buffer
+        cur ^= 1;
+        next ^= 1;
+    }
+
+    // ========================
+    // Epilogue
+    // ========================
+    for(int k = 0; k < BK_V8; k++){
+        float reg_A[TM_V8];
+        float reg_B[TN_V8];
+
+        for(int i = 0; i < TM_V8; i++){
+            reg_A[i] =
+                As[cur][local_row + i][k];
+        }
+
+        for(int i = 0; i < TN_V8; i++){
+            reg_B[i] =
+                Bs[cur][k][local_col + i];
+        }
+
+        for(int i = 0; i < TM_V8; i++){
+            for(int j = 0; j < TN_V8; j++){
+                sum[i][j] +=
+                    reg_A[i] * reg_B[j];
+            }
+        }
+    }
+
+    // ========================
+    // C Store
+    // ========================
+    for(int i = 0; i < TM_V8; i++){
+        //确定C的行
+        int row_C = global_row + i;
+        int linear_idx_C = row_C * N + global_col;
+
+        if(row_C < M && global_col + VEC_V8 - 1 < N && linear_idx_C % VEC_V8 == 0){//没超出边界、符合16 byte对齐，进入fast path
+            float4 out = make_float4(
+                sum[i][0],
+                sum[i][1],
+                sum[i][2],
+                sum[i][3]
+            );
+
+            *reinterpret_cast<float4*>(&C[linear_idx_C]) = out;
+        }else{
+            for(int j = 0; j < TN_V8; j++){
+                int col_C = global_col + j;
+
+                if(row_C < M && col_C < N){
+                    C[row_C * N + col_C] = sum[i][j];
+                }
+            }
+        }
+    }
+}
+
+//V8_2
+__global__ void gemmWarpTiledDoubleBufferedV8_2(
+    const float* A,
+    const float* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int tid = ty * blockDim.x + tx;//thread 在 block 内线性编号
+
+    //计算warp id和lane id
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    // Warp tile 在 Block tile 中的坐标
+    int warp_row = warp_id / WARPS_N_V8;
+    int warp_col = warp_id % WARPS_N_V8;
+
+    // Thread tile 在 Warp tile 中的坐标
+    int lane_row = lane_id / LANES_N_V8;
+    int lane_col = lane_id % LANES_N_V8;
+
+    __shared__ __align__(16) float As[2][BM_V8][BK_V8 + 1];
+    __shared__ __align__(16) float Bs[2][BK_V8][BN_V8];
+
+    float sum[TM_V8][TN_V8] = {0.0f};
+
+    // 当前线程负责的 C 微块在 Block tile 内的起点
+    int local_row = warp_row * WM_V8 + lane_row * TM_V8;
+    int local_col = warp_col * WN_V8 + lane_col * TN_V8;
+
+    // 当前线程负责的 C 微块在完整矩阵中的起点
+    int global_row = blockIdx.y * BM_V8 + local_row;
+    int global_col = blockIdx.x * BN_V8 + local_col;
+
+    // ========================
+    // Prologue
+    // ========================
+    int num_tiles = (K + BK_V8 - 1) / BK_V8;
+
+    //A -> As
+    int a_vecs_per_row = BK_V8 / VEC_V8;
+
+    int row_As = tid / a_vecs_per_row;
+    int col_As = (tid % a_vecs_per_row) * VEC_V8;
+
+    int row_A = blockIdx.y * BM_V8 + row_As;
+    int col_A = 0 * BK_V8 + col_As;
+
+    int linear_idx_A = row_A * K + col_A;
+
+    if(row_A < M && col_A + VEC_V8 - 1 < K && linear_idx_A % VEC_V8 == 0){
+        float4 vec = *reinterpret_cast<const float4*>(&A[linear_idx_A]);
+
+        As[0][row_As][col_As + 0] = vec.x;
+        As[0][row_As][col_As + 1] = vec.y;
+        As[0][row_As][col_As + 2] = vec.z;
+        As[0][row_As][col_As + 3] = vec.w;
+    }else{
+        for(int i = 0; i < VEC_V8; i++){
+            int current_col_A = col_A + i;
+
+            if(row_A < M && current_col_A < K){
+                As[0][row_As][col_As + i] = A[linear_idx_A + i];
+            }else{
+                As[0][row_As][col_As + i] = 0.0f;
+            }
+        }
+    }
+
+    //B -> Bs
+    int b_vecs_per_row = BN_V8 / VEC_V8;
+
+    int row_Bs = tid / b_vecs_per_row;
+    int col_Bs = (tid % b_vecs_per_row) * VEC_V8;
+
+    int row_B = 0 * BK_V8 + row_Bs;
+    int col_B = blockIdx.x * BN_V8 + col_Bs;
+
+    int linear_idx_B = row_B * N + col_B;
+
+    if(row_B < K && col_B + VEC_V8 - 1 < N && linear_idx_B % VEC_V8 == 0){
+        float4 vec = *reinterpret_cast<const float4*>(&B[linear_idx_B]);
+
+        *reinterpret_cast<float4*>(&Bs[0][row_Bs][col_Bs]) = vec;
+    }else{
+        for(int i = 0; i < VEC_V8; i++){
+            int current_col_B = col_B + i;
+
+            if(row_B < K && current_col_B < N){
+                Bs[0][row_Bs][col_Bs + i] = B[linear_idx_B + i];
+            }else{
+                Bs[0][row_Bs][col_Bs + i] = 0.0f;
+            }
+        }
+    }
+
+
+    int cur = 0;
+    int next = 1;
+
+    __syncthreads();
+
+    // ========================
+    // Steady State
+    // ========================
+
+    for(int tile = 0; tile < num_tiles - 1; tile++){
+        float4 next_A = make_float4(0.f, 0.f, 0.f, 0.f);
+        float4 next_B = make_float4(0.f, 0.f, 0.f, 0.f);
+
+        //next_A, Global→Register ,prefetch
+        int next_row_A = row_A;
+        int next_col_A = (tile + 1) * BK_V8 + col_As;
+        int next_linear_idx_A = next_row_A * K + next_col_A;
+
+        if(next_row_A < M && next_col_A + VEC_V8 - 1 < K && next_linear_idx_A % VEC_V8 == 0){
+            next_A = *reinterpret_cast<const float4*>(&A[next_linear_idx_A]);
+        }else if(next_row_A < M){
+            if (next_col_A + 0 < K)
+                next_A.x = A[next_linear_idx_A + 0];
+
+            if (next_col_A + 1 < K)
+                next_A.y = A[next_linear_idx_A + 1];
+
+            if (next_col_A + 2 < K)
+                next_A.z = A[next_linear_idx_A + 2];
+
+            if (next_col_A + 3 < K)
+                next_A.w = A[next_linear_idx_A + 3];
+        }
+
+        //next_B, Global→Register ,prefetch
+        int next_row_B = (tile + 1) * BK_V8 + row_Bs;
+        int next_col_B = col_B;
+        int next_linear_idx_B = next_row_B * N + next_col_B;
+
+        if(next_row_B < K && next_col_B + VEC_V8 - 1 < N && next_linear_idx_B % VEC_V8 == 0){
+            next_B = *reinterpret_cast<const float4*>(&B[next_linear_idx_B]);
+        }else if(next_row_B < K){
+            if (next_col_B + 0 < N)
+                next_B.x = B[next_linear_idx_B + 0];
+
+            if (next_col_B + 1 < N)
+                next_B.y = B[next_linear_idx_B + 1];
+
+            if (next_col_B + 2 < N)
+                next_B.z = B[next_linear_idx_B + 2];
+
+            if (next_col_B + 3 < N)
+                next_B.w = B[next_linear_idx_B + 3];
+        }
+
+        //cur compute
+        for(int k = 0; k < BK_V8; k++){
+            float reg_A[TM_V8];
+            float reg_B[TN_V8];
+            //As -> reg_A
+            for(int i = 0; i < TM_V8; i++){
+                reg_A[i] = As[cur][local_row + i][k];
+            }
+            //Bs -> reg_B
+            for(int i = 0; i < TN_V8; i++){
+                reg_B[i] = Bs[cur][k][local_col + i];
+            }
+            //计算sum
+            for(int i = 0; i < TM_V8; i++){
+                for(int j = 0; j < TN_V8; j++){
+                    sum[i][j] += reg_A[i] * reg_B[j];
+                }
+            }
+        }
+
+        //next_A / next_B registers -> Shared[next]
+        As[next][row_As][col_As + 0] = next_A.x;
+        As[next][row_As][col_As + 1] = next_A.y;
+        As[next][row_As][col_As + 2] = next_A.z;
+        As[next][row_As][col_As + 3] = next_A.w;
+        *reinterpret_cast<float4*>(&Bs[next][row_Bs][col_Bs]) = next_B;
+
+        __syncthreads();
+
+        // swap buffer
+        cur ^= 1;
+        next ^= 1;
+    }
+
+    // ========================
+    // Epilogue
+    // ========================
+    for(int k = 0; k < BK_V8; k++){
+        float reg_A[TM_V8];
+        float reg_B[TN_V8];
+
+        for(int i = 0; i < TM_V8; i++){
+            reg_A[i] =
+                As[cur][local_row + i][k];
+        }
+
+        for(int i = 0; i < TN_V8; i++){
+            reg_B[i] =
+                Bs[cur][k][local_col + i];
+        }
+
+        for(int i = 0; i < TM_V8; i++){
+            for(int j = 0; j < TN_V8; j++){
+                sum[i][j] +=
+                    reg_A[i] * reg_B[j];
+            }
+        }
+    }
+
+    // ========================
+    // C Store
+    // ========================
+    for(int i = 0; i < TM_V8; i++){
+        //确定C的行
+        int row_C = global_row + i;
+        int linear_idx_C = row_C * N + global_col;
+
+        if(row_C < M && global_col + VEC_V8 - 1 < N && linear_idx_C % VEC_V8 == 0){//没超出边界、符合16 byte对齐，进入fast path
+            float4 out = make_float4(
+                sum[i][0],
+                sum[i][1],
+                sum[i][2],
+                sum[i][3]
+            );
+
+            *reinterpret_cast<float4*>(&C[linear_idx_C]) = out;
+        }else{
+            for(int j = 0; j < TN_V8; j++){
+                int col_C = global_col + j;
+
+                if(row_C < M && col_C < N){
+                    C[row_C * N + col_C] = sum[i][j];
+                }
+            }
+        }
+    }
+}
+
 //CPU Reference
 void gemmCPU(
     const float* A,
@@ -1287,6 +1790,87 @@ void gemmCPU(
             C[row * N + col] = sum;
         }
     }
+}
+
+// V8 共用计时和正确性检查；两个版本分别分配、释放输出。
+double runV8BenchmarkAndCheck(
+    bool padding,
+    const float* d_A,
+    const float* d_B,
+    const vector<float>& h_cpu_C,
+    int M, int N, int K,
+    dim3 grid, dim3 block,
+    int warmup_runs, int benchmark_runs)
+{
+    const char* name = padding ? "V8_2" : "V8_1";
+    size_t C_bytes = static_cast<size_t>(M) * N * sizeof(float);
+    vector<float> h_C(h_cpu_C.size());
+    float* d_C = nullptr;
+    CHECK_CUDA(cudaMalloc(&d_C, C_bytes));
+    // 用 NaN 填充，避免漏写元素被旧数据掩盖。
+    CHECK_CUDA(cudaMemset(d_C, 0xff, C_bytes));
+
+    for (int i = 0; i < warmup_runs; ++i) {
+        if (padding) {
+            gemmWarpTiledDoubleBufferedV8_2<<<grid, block>>>(
+                d_A, d_B, d_C, M, N, K);
+        } else {
+            gemmWarpTiledDoubleBufferedV8_1<<<grid, block>>>(
+                d_A, d_B, d_C, M, N, K);
+        }
+    }
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+    CHECK_CUDA(cudaEventRecord(start));
+    for (int i = 0; i < benchmark_runs; ++i) {
+        if (padding) {
+            gemmWarpTiledDoubleBufferedV8_2<<<grid, block>>>(
+                d_A, d_B, d_C, M, N, K);
+        } else {
+            gemmWarpTiledDoubleBufferedV8_1<<<grid, block>>>(
+                d_A, d_B, d_C, M, N, K);
+        }
+    }
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaEventSynchronize(stop));
+
+    float total_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+    float avg_ms = total_ms / benchmark_runs;
+    double gflops = (2.0 * M * N * K) / (avg_ms / 1000.0) / 1e9;
+    cout << name << " average latency = " << avg_ms << " ms" << endl;
+    cout << name << " GFLOPS = " << gflops << endl;
+
+    CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, C_bytes, cudaMemcpyDeviceToHost));
+    float max_abs_error = 0.0f;
+    bool correct = true;
+    for (size_t i = 0; i < h_C.size(); ++i) {
+        float error = fabsf(h_cpu_C[i] - h_C[i]);
+        if (!isfinite(error)) {
+            correct = false;
+            max_abs_error = numeric_limits<float>::infinity();
+        } else {
+            max_abs_error = max(max_abs_error, error);
+        }
+    }
+    correct = correct && max_abs_error < 1e-5f;
+    cout << name << " (" << M << " x " << N << " x " << K
+         << ") max absolute error = " << max_abs_error << endl;
+    cout << name << (correct ? ": Correct!" : ": Mismatch!") << endl;
+    cout << endl;
+
+    CHECK_CUDA(cudaFree(d_C));
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+    if (!correct) {
+        exit(EXIT_FAILURE);
+    }
+    return gflops;
 }
 
 void runV7ControlFlowCorrectnessTest(
@@ -1441,6 +2025,15 @@ void runV7ControlFlowCorrectnessTest(
     }
 
     cout<<endl;
+
+    // 复用当前输入及 CPU 参考结果，检查 V8 的相同边界情况。
+    dim3 block_v8(BN_V8 / TN_V8, BM_V8 / TM_V8);
+    dim3 grid_v8((N + BN_V8 - 1) / BN_V8, (M + BM_V8 - 1) / BM_V8);
+    runV8BenchmarkAndCheck(false, d_A, d_B, h_cpu_C,
+        M, N, K, grid_v8, block_v8, 0, 1);
+    runV8BenchmarkAndCheck(true, d_A, d_B, h_cpu_C,
+        M, N, K, grid_v8, block_v8, 0, 1);
+
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
     CHECK_CUDA(cudaFree(d_C));
@@ -1528,6 +2121,16 @@ int main(){
     dim3 grid_v7_2(
         (N + BN_V7 - 1) / BN_V7,
         (M + BM_V7 - 1) / BM_V7
+    );
+
+    dim3 block_v8(
+        BN_V8 / TN_V8, // 16
+        BM_V8 / TM_V8  // 16
+    );
+
+    dim3 grid_v8(
+        (N + BN_V8 - 1) / BN_V8,
+        (M + BM_V8 - 1) / BM_V8
     );
 
     //准备Host数据
@@ -2248,6 +2851,20 @@ int main(){
 
 /************************************************************************************ */
 
+    // V8_1 / V8_2：相同输入、预热次数和计时次数。
+    double v8_1_gflops = runV8BenchmarkAndCheck(
+        false, d_A, d_B, h_cpu_C, M, N, K,
+        grid_v8, block_v8, warmup_runs, benchmark_runs);
+    double v8_2_gflops = runV8BenchmarkAndCheck(
+        true, d_A, d_B, h_cpu_C, M, N, K,
+        grid_v8, block_v8, warmup_runs, benchmark_runs);
+
+    cout << "V8_1 / V7_1 speedup = "
+         << v8_1_gflops / double_buffered_gflops << endl;
+    cout << "V8_2 / V8_1 speedup = "
+         << v8_2_gflops / v8_1_gflops << endl;
+    cout << endl;
+
     //创建 cuBLAS handle，执行cuBLAS内的工业级GEMM，以此为参照
     cublasHandle_t handle;
 
@@ -2914,12 +3531,13 @@ int main(){
     CHECK_CUDA(cudaFree(d_boundary_v7_C));
     CHECK_CUDA(cudaFree(d_boundary_v7_2_C));
 
-    cout << "V7 and V7_2 control-flow correctness tests" << endl;
+    cout << "V7, V7_2, V8_1 and V8_2 control-flow correctness tests" << endl;
     cout<<endl;
 
     runV7ControlFlowCorrectnessTest(1, 64, 64, 16);
     runV7ControlFlowCorrectnessTest(2, 67, 69, 7);
     runV7ControlFlowCorrectnessTest(3, 67, 69, 17);
+    runV7ControlFlowCorrectnessTest(4, boundary_M, boundary_N, boundary_K);
     
     //cuBLAS正确性检验
     float cublas_max_abs_error = 0.0f;
