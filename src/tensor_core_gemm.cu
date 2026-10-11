@@ -7,6 +7,7 @@
 #include <limits>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <mma.h>
 
 using namespace std;
@@ -72,6 +73,16 @@ static_assert(B_SHARED_STRIDE_V2_1 >= BLOCK_N_V2 &&
         if (err != cudaSuccess) {                                            \
             fprintf(stderr, "CUDA error: %s (%s:%d)\n",                    \
                     cudaGetErrorString(err), __FILE__, __LINE__);            \
+            exit(EXIT_FAILURE);                                              \
+        }                                                                    \
+    } while (0)
+
+#define CHECK_CUBLAS(call)                                                   \
+    do {                                                                     \
+        cublasStatus_t status = (call);                                      \
+        if (status != CUBLAS_STATUS_SUCCESS) {                               \
+            fprintf(stderr, "cuBLAS error: %s (%s:%d)\n",                 \
+                    cublasGetStatusString(status), __FILE__, __LINE__);       \
             exit(EXIT_FAILURE);                                              \
         }                                                                    \
     } while (0)
@@ -792,7 +803,7 @@ ErrorStats compareResults(
     return stats;
 }
 
-enum class KernelVersion { V0, V1, V1_1, V2, V2_1 };
+enum class KernelVersion { V0, V1, V1_1, V2, V2_1, CUBLAS };
 
 struct BenchmarkResult {
     vector<float> latencies_ms;
@@ -821,6 +832,8 @@ const char* kernelName(KernelVersion version)
             return "V2 fragment-reuse";
         case KernelVersion::V2_1:
             return "V2.1 B-padding-72";
+        case KernelVersion::CUBLAS:
+            return "cuBLAS GemmEx";
     }
     return "unknown";
 }
@@ -832,7 +845,8 @@ void launchKernel(
     float* d_C,
     int M,
     int N,
-    int K)
+    int K,
+    cublasHandle_t cublas_handle = nullptr)
 {
     const dim3 block(THREADS_PER_BLOCK);
     if (version == KernelVersion::V0) {
@@ -849,9 +863,27 @@ void launchKernel(
     } else if (version == KernelVersion::V2) {
         const dim3 grid(N / BLOCK_N_V2, M / BLOCK_M_V2);
         wmmaGemmSharedV2<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-    } else {
+    } else if (version == KernelVersion::V2_1) {
         const dim3 grid(N / BLOCK_N_V2, M / BLOCK_M_V2);
         wmmaGemmSharedV2_1<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    } else {
+        // cuBLAS is column-major. The row-major identity
+        // C^T = (A B)^T = B^T A^T lets the same buffers represent an
+        // N-by-M column-major result without materializing any transpose.
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        CHECK_CUBLAS(cublasGemmEx(
+            cublas_handle,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            N, M, K,
+            &alpha,
+            d_B, CUDA_R_16F, N,
+            d_A, CUDA_R_16F, K,
+            &beta,
+            d_C, CUDA_R_32F, N,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT));
     }
 }
 
@@ -866,14 +898,15 @@ CorrectnessResult checkKernel(
     int M,
     int N,
     int K,
-    size_t C_bytes)
+    size_t C_bytes,
+    cublasHandle_t cublas_handle = nullptr)
 {
     constexpr float KERNEL_ABS_TOLERANCE = 1.0e-2f;
     constexpr float KERNEL_REL_TOLERANCE = 1.0e-2f;
 
     // A NaN fill makes a missing tile/store visible to the finite-value check.
     CHECK_CUDA(cudaMemset(d_C, 0xff, C_bytes));
-    launchKernel(version, d_A, d_B, d_C, M, N, K);
+    launchKernel(version, d_A, d_B, d_C, M, N, K, cublas_handle);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(h_C.data(), d_C, C_bytes, cudaMemcpyDeviceToHost));
@@ -902,7 +935,8 @@ BenchmarkResult benchmarkKernel(
     int K,
     int warmup_runs,
     int benchmark_runs,
-    int measurement_rounds)
+    int measurement_rounds,
+    cublasHandle_t cublas_handle = nullptr)
 {
     BenchmarkResult result;
     result.latencies_ms.reserve(measurement_rounds);
@@ -913,14 +947,14 @@ BenchmarkResult benchmarkKernel(
 
     for (int round = 0; round < measurement_rounds; ++round) {
         for (int i = 0; i < warmup_runs; ++i) {
-            launchKernel(version, d_A, d_B, d_C, M, N, K);
+            launchKernel(version, d_A, d_B, d_C, M, N, K, cublas_handle);
         }
         CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
 
         CHECK_CUDA(cudaEventRecord(start));
         for (int i = 0; i < benchmark_runs; ++i) {
-            launchKernel(version, d_A, d_B, d_C, M, N, K);
+            launchKernel(version, d_A, d_B, d_C, M, N, K, cublas_handle);
         }
         CHECK_CUDA(cudaEventRecord(stop));
         CHECK_CUDA(cudaGetLastError());
@@ -948,9 +982,9 @@ BenchmarkResult benchmarkKernel(
     return result;
 }
 
-// Benchmark all supported kernels in a rotating order. This keeps the same
-// warmup and timed-launch counts while reducing fixed-order clock/temperature
-// bias in close comparisons such as V2 versus V2.1 at 1024 cubed.
+// Benchmark the selected implementations in a rotating order. With the final
+// V2.1/cuBLAS pair, consecutive rounds reverse the order to reduce fixed-order
+// clock and temperature bias.
 vector<BenchmarkResult> benchmarkKernelsInterleaved(
     const vector<KernelVersion>& versions,
     const half* d_A,
@@ -961,7 +995,8 @@ vector<BenchmarkResult> benchmarkKernelsInterleaved(
     int K,
     int warmup_runs,
     int benchmark_runs,
-    int measurement_rounds)
+    int measurement_rounds,
+    cublasHandle_t cublas_handle = nullptr)
 {
     vector<BenchmarkResult> results(versions.size());
     for (BenchmarkResult& result : results) {
@@ -978,14 +1013,16 @@ vector<BenchmarkResult> benchmarkKernelsInterleaved(
             const KernelVersion version = versions[index];
 
             for (int i = 0; i < warmup_runs; ++i) {
-                launchKernel(version, d_A, d_B, d_C, M, N, K);
+                launchKernel(version, d_A, d_B, d_C, M, N, K,
+                             cublas_handle);
             }
             CHECK_CUDA(cudaGetLastError());
             CHECK_CUDA(cudaDeviceSynchronize());
 
             CHECK_CUDA(cudaEventRecord(start));
             for (int i = 0; i < benchmark_runs; ++i) {
-                launchKernel(version, d_A, d_B, d_C, M, N, K);
+                launchKernel(version, d_A, d_B, d_C, M, N, K,
+                             cublas_handle);
             }
             CHECK_CUDA(cudaEventRecord(stop));
             CHECK_CUDA(cudaGetLastError());
@@ -1070,7 +1107,8 @@ bool runCase(
     int N,
     int K,
     bool run_benchmark,
-    const char* case_name)
+    const char* case_name,
+    cublasHandle_t cublas_handle)
 {
     const bool v1_supported = M % BLOCK_M == 0 && N % BLOCK_N == 0 &&
                               K % BLOCK_K == 0;
@@ -1145,8 +1183,11 @@ bool runCase(
     CorrectnessResult v1_1_correctness;
     CorrectnessResult v2_correctness;
     CorrectnessResult v2_1_correctness;
+    CorrectnessResult cublas_correctness;
     ErrorStats v1_1_v2_stats;
     ErrorStats v2_v2_1_stats;
+    ErrorStats v2_1_cublas_stats;
+    vector<float> h_C_v2_1;
     if (v1_supported) {
         cout << "V1 shared launch = (" << N / BLOCK_N << ", "
              << M / BLOCK_M << ") blocks x " << THREADS_PER_BLOCK
@@ -1194,6 +1235,7 @@ bool runCase(
             KernelVersion::V2_1, d_A, d_B, d_C, h_C,
             h_reference_original, h_reference_quantized, M, N, K, C_bytes);
         printCorrectness(KernelVersion::V2_1, v2_1_correctness);
+        h_C_v2_1 = h_C;
         v2_v2_1_stats = compareResults(
             h_C_v2, h_C,
             numeric_limits<float>::infinity(),
@@ -1207,57 +1249,64 @@ bool runCase(
                 "of 64 and K a multiple of 16)." << endl;
     }
 
+    cout << "cuBLAS GemmEx launch: FP16 A/B, FP32 C/compute, "
+            "CUBLAS_GEMM_DEFAULT" << endl;
+    cublas_correctness = checkKernel(
+        KernelVersion::CUBLAS, d_A, d_B, d_C, h_C,
+        h_reference_original, h_reference_quantized, M, N, K, C_bytes,
+        cublas_handle);
+    printCorrectness(KernelVersion::CUBLAS, cublas_correctness);
+    if (v2_supported) {
+        v2_1_cublas_stats = compareResults(
+            h_C_v2_1, h_C,
+            numeric_limits<float>::infinity(),
+            numeric_limits<float>::infinity());
+        cout << "V2.1 vs cuBLAS max absolute difference = "
+             << v2_1_cublas_stats.max_abs_error << endl;
+        cout << "V2.1 vs cuBLAS max relative difference = "
+             << v2_1_cublas_stats.max_rel_error << endl;
+    }
+
     if (run_benchmark) {
-        vector<KernelVersion> benchmark_versions{KernelVersion::V0};
-        if (v1_supported) {
-            benchmark_versions.push_back(KernelVersion::V1);
-            benchmark_versions.push_back(KernelVersion::V1_1);
-        }
+        vector<KernelVersion> benchmark_versions;
         if (v2_supported) {
-            benchmark_versions.push_back(KernelVersion::V2);
             benchmark_versions.push_back(KernelVersion::V2_1);
+        } else {
+            benchmark_versions.push_back(KernelVersion::V0);
         }
+        benchmark_versions.push_back(KernelVersion::CUBLAS);
         vector<BenchmarkResult> benchmark_results = benchmarkKernelsInterleaved(
             benchmark_versions, d_A, d_B, d_C, M, N, K,
-            warmup_runs, benchmark_runs, measurement_rounds);
+            warmup_runs, benchmark_runs, measurement_rounds, cublas_handle);
         for (size_t i = 0; i < benchmark_versions.size(); ++i) {
             printBenchmark(benchmark_versions[i], benchmark_results[i],
                            warmup_runs, benchmark_runs);
         }
-
-        if (v1_supported) {
-            const BenchmarkResult& v0_benchmark = benchmark_results[0];
-            const BenchmarkResult& v1_benchmark = benchmark_results[1];
-            const BenchmarkResult& v1_1_benchmark = benchmark_results[2];
+        if (v2_supported) {
+            const BenchmarkResult& v2_1_benchmark = benchmark_results[0];
+            const BenchmarkResult& cublas_benchmark = benchmark_results[1];
             cout << fixed << setprecision(4);
-            cout << "V1/V0 speedup (median latency) = "
-                 << v0_benchmark.median_ms / v1_benchmark.median_ms
+            cout << "V2.1 / cuBLAS TFLOPS ratio = "
+                 << v2_1_benchmark.median_tflops /
+                        cublas_benchmark.median_tflops
+                 << endl;
+            cout << "cuBLAS latency / V2.1 latency = "
+                 << cublas_benchmark.median_ms /
+                        v2_1_benchmark.median_ms
                  << "x" << endl;
-            cout << "V1.1/V1 speedup (median latency) = "
-                 << v1_benchmark.median_ms / v1_1_benchmark.median_ms
-                 << "x" << endl;
-            if (v2_supported) {
-                const BenchmarkResult& v2_benchmark = benchmark_results[3];
-                cout << "V2/V1.1 speedup (median latency) = "
-                     << v1_1_benchmark.median_ms / v2_benchmark.median_ms
-                     << "x" << endl;
-                const BenchmarkResult& v2_1_benchmark = benchmark_results[4];
-                cout << "V2.1/V2 speedup (median latency) = "
-                     << v2_benchmark.median_ms / v2_1_benchmark.median_ms
-                     << "x" << endl;
-            }
         }
     }
 
     CHECK_CUDA(cudaFree(d_A));
     CHECK_CUDA(cudaFree(d_B));
     CHECK_CUDA(cudaFree(d_C));
-    return v0_correctness.correct &&
+    return v0_correctness.correct && cublas_correctness.correct &&
            (!v1_supported ||
             (v1_correctness.correct && v1_1_correctness.correct)) &&
            (!v2_supported ||
             (v2_correctness.correct && v2_1_correctness.correct &&
-             v1_1_v2_stats.finite && v2_v2_1_stats.finite));
+             v1_1_v2_stats.finite && v2_v2_1_stats.finite &&
+             v2_1_cublas_stats.finite));
 }
 
 int main(int argc, char** argv)
@@ -1293,16 +1342,36 @@ int main(int argc, char** argv)
     cout << "Reference 2 pass criterion: abs_error <= 1e-2 + 1e-2 * "
             "abs(reference)" << endl;
 
-    bool correct = runCase(M, N, K, true, "benchmark");
+    cublasHandle_t cublas_handle = nullptr;
+    CHECK_CUBLAS(cublasCreate(&cublas_handle));
+    CHECK_CUBLAS(cublasSetStream(cublas_handle, nullptr));
+    CHECK_CUBLAS(cublasSetPointerMode(cublas_handle,
+                                     CUBLAS_POINTER_MODE_HOST));
+    int cublas_version = 0;
+    CHECK_CUBLAS(cublasGetVersion(cublas_handle, &cublas_version));
+    int driver_version = 0;
+    int runtime_version = 0;
+    CHECK_CUDA(cudaDriverGetVersion(&driver_version));
+    CHECK_CUDA(cudaRuntimeGetVersion(&runtime_version));
+    cout << "CUDA driver API version = " << driver_version
+         << ", CUDA runtime version = " << runtime_version
+         << ", cuBLAS runtime version = " << cublas_version << endl;
+    cout << "Timed comparison uses default CUDA stream, FP16 A/B, FP32 C, "
+            "CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT." << endl;
+
+    bool correct = runCase(M, N, K, true, "benchmark", cublas_handle);
     // This non-square grid catches swapped/missing entries in the 2 x 2 warp
     // mapping while keeping CPU-reference work small.
     if (M != 64 || N != 96 || K != 32) {
-        correct = runCase(64, 96, 32, false, "small 2x2 warp-mapping test") &&
+        correct = runCase(64, 96, 32, false,
+                          "small 2x2 warp-mapping test", cublas_handle) &&
                   correct;
     }
     if (M != 128 || N != 192 || K != 64) {
         correct = runCase(128, 192, 64, false,
-                          "V2/V2.1 non-square warp-mapping test") && correct;
+                          "V2/V2.1 non-square warp-mapping test",
+                          cublas_handle) && correct;
     }
+    CHECK_CUBLAS(cublasDestroy(cublas_handle));
     return correct ? EXIT_SUCCESS : EXIT_FAILURE;
 }
