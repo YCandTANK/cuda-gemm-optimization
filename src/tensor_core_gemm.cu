@@ -28,6 +28,18 @@ constexpr int B_SHARED_STRIDE = 40;
 constexpr int WARPS_M = 2;
 constexpr int WARPS_N = 2;
 
+
+constexpr int BLOCK_M_V2 = 64;
+constexpr int BLOCK_N_V2 = 64;
+constexpr int BLOCK_K_V2 = 16;
+
+constexpr int WARP_TILE_M_V2 = 32;
+constexpr int WARP_TILE_N_V2 = 32;
+
+constexpr int WARPS_M_V2 = 2;
+constexpr int WARPS_N_V2 = 2;
+
+
 static_assert(WARPS_M * WARPS_N == WARPS_PER_BLOCK,
               "The 2D warp layout must match the block warp count");
 static_assert(BLOCK_M == WARPS_M * WMMA_M &&
@@ -36,6 +48,17 @@ static_assert(BLOCK_M == WARPS_M * WMMA_M &&
 static_assert(B_SHARED_STRIDE >= BLOCK_N && B_SHARED_STRIDE % 8 == 0,
               "The padded half WMMA leading dimension must be >= BLOCK_N "
               "and a multiple of 8 elements");
+static_assert(WARPS_M_V2 * WARPS_N_V2 == WARPS_PER_BLOCK,
+              "The V2 warp layout must match the block warp count");
+static_assert(BLOCK_M_V2 == WARPS_M_V2 * WARP_TILE_M_V2 &&
+              BLOCK_N_V2 == WARPS_N_V2 * WARP_TILE_N_V2 &&
+              BLOCK_K_V2 == WMMA_K,
+              "V2 block and warp tiles are inconsistent");
+static_assert(WARP_TILE_M_V2 == 2 * WMMA_M &&
+              WARP_TILE_N_V2 == 2 * WMMA_N,
+              "Each V2 warp tile must contain four WMMA tiles");
+static_assert(BLOCK_K_V2 % 8 == 0 && BLOCK_N_V2 % 8 == 0,
+              "V2 half WMMA leading dimensions must be multiples of 8");
 
 #define CHECK_CUDA(call)                                                     \
     do {                                                                     \
@@ -378,6 +401,206 @@ __global__ void wmmaGemmSharedV1_1(
     );
 }
 
+__global__ void wmmaGemmSharedV2(
+    const half* A,
+    const half* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    int tid = threadIdx.x;
+
+    //Block Mapping
+    int block_row = blockIdx.y * BLOCK_M_V2;
+    int block_col = blockIdx.x * BLOCK_N_V2;
+
+    //Warp Mapping
+    int warp_id = tid / 32;
+    int warp_row = warp_id / WARPS_N_V2;
+    int warp_col = warp_id % WARPS_N_V2;
+
+    //Warp C Tile 起点
+    int warp_c_row = block_row + warp_row * WARP_TILE_M_V2;
+    int warp_c_col = block_col + warp_col * WARP_TILE_N_V2;
+
+    //Shared Memory
+    __shared__ __align__(32) half As[BLOCK_M_V2][BLOCK_K_V2];
+    __shared__ __align__(32) half Bs[BLOCK_K_V2][BLOCK_N_V2];
+
+    //A/B fragments 声明
+    using AFrag = wmma::fragment<
+        wmma::matrix_a,
+        WMMA_M, WMMA_N, WMMA_K,
+        half,
+        wmma::row_major
+    >;
+
+    using BFrag = wmma::fragment<
+        wmma::matrix_b,
+        WMMA_M, WMMA_N, WMMA_K,
+        half,
+        wmma::row_major
+    >;
+
+    AFrag a0, a1;
+    BFrag b;
+
+    //四个 C accumulator 声明与初始化
+    using AccFrag = wmma::fragment<
+        wmma::accumulator,
+        WMMA_M, WMMA_N, WMMA_K,
+        float
+    >;
+
+    AccFrag c00;
+    AccFrag c01;
+    AccFrag c10;
+    AccFrag c11;
+
+    //accumulator 清零
+    wmma::fill_fragment(c00, 0.0f);
+    wmma::fill_fragment(c01, 0.0f);
+    wmma::fill_fragment(c10, 0.0f);
+    wmma::fill_fragment(c11, 0.0f);
+
+    //k循环
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K_V2) {
+        //Cooperative Load A
+        for(int idx = tid; idx < BLOCK_M_V2 * BLOCK_K_V2; idx += blockDim.x){
+            int row_As = idx / BLOCK_K_V2;
+            int col_As = idx % BLOCK_K_V2;
+
+            int row_A = block_row + row_As;
+            int col_A = k0 + col_As;
+
+            As[row_As][col_As] = A[row_A * K + col_A];
+        }
+
+        //Cooperative Load B
+        for(int idx = tid; idx < BLOCK_K_V2 * BLOCK_N_V2; idx += blockDim.x){
+            int row_Bs = idx / BLOCK_N_V2;
+            int col_Bs = idx % BLOCK_N_V2;
+
+            int row_B = k0 + row_Bs;
+            int col_B = block_col + col_Bs;
+
+            Bs[row_Bs][col_Bs] = B[row_B * N + col_B];
+        }
+
+        //等待整个 Block 完成搬运
+        __syncthreads();
+
+        //Shared → WMMA fragments
+        //    A pointer
+        const half* A0_ptr = &As[warp_row * WARP_TILE_M_V2][0];
+
+        const half* A1_ptr = &As[warp_row * WARP_TILE_M_V2 + WMMA_M][0];
+
+
+        //    B pointer
+        const half* B0_ptr = &Bs[0][warp_col * WARP_TILE_N_V2];
+
+        const half* B1_ptr = &Bs[0][warp_col * WARP_TILE_N_V2 + WMMA_N];
+
+        // 加载两个 A Fragment
+        wmma::load_matrix_sync(
+            a0,
+            A0_ptr,
+            BLOCK_K_V2
+        );
+
+        wmma::load_matrix_sync(
+            a1,
+            A1_ptr,
+            BLOCK_K_V2
+        );
+
+        // 加载 B0
+        wmma::load_matrix_sync(
+            b,
+            B0_ptr,
+            BLOCK_N_V2
+        );
+
+        //mma_sync,B0 复用两次
+        wmma::mma_sync(
+            c00,
+            a0,
+            b,
+            c00
+        );
+
+        wmma::mma_sync(
+            c10,
+            a1,
+            b,
+            c10
+        );
+
+        // 加载 B1，复用 b 变量
+        wmma::load_matrix_sync(
+            b,
+            B1_ptr,
+            BLOCK_N_V2
+        );
+
+        // B1 复用两次
+        wmma::mma_sync(
+            c01,
+            a0,
+            b,
+            c01
+        );
+
+        wmma::mma_sync(
+            c11,
+            a1,
+            b,
+            c11
+        );
+
+        //确保所有 Warp 已使用完当前 Shared Tile
+        __syncthreads();
+    }
+
+//结果写回C
+    // C pointer
+    float* C00_ptr = C + warp_c_row * N + warp_c_col;
+    float* C01_ptr = C + warp_c_row * N + (warp_c_col + WMMA_N);
+    float* C10_ptr = C + (warp_c_row + WMMA_M) * N + warp_c_col;
+    float* C11_ptr = C + (warp_c_row + WMMA_M) * N + (warp_c_col + WMMA_N);
+
+    wmma::store_matrix_sync(
+        C00_ptr,
+        c00,
+        N,
+        wmma::mem_row_major
+    );
+
+    wmma::store_matrix_sync(
+        C01_ptr,
+        c01,
+        N,
+        wmma::mem_row_major
+    );
+
+    wmma::store_matrix_sync(
+        C10_ptr,
+        c10,
+        N,
+        wmma::mem_row_major
+    );
+
+    wmma::store_matrix_sync(
+        C11_ptr,
+        c11,
+        N,
+        wmma::mem_row_major
+    );
+
+}
+
 // CPU FP32 reference. The same routine is used for both original FP32 inputs
 // and FP16-quantized inputs converted back to FP32.
 void gemmCPU(
@@ -442,7 +665,7 @@ ErrorStats compareResults(
     return stats;
 }
 
-enum class KernelVersion { V0, V1, V1_1 };
+enum class KernelVersion { V0, V1, V1_1, V2 };
 
 struct BenchmarkResult {
     vector<float> latencies_ms;
@@ -467,6 +690,8 @@ const char* kernelName(KernelVersion version)
             return "V1 shared";
         case KernelVersion::V1_1:
             return "V1.1 B-padding-40";
+        case KernelVersion::V2:
+            return "V2 fragment-reuse";
     }
     return "unknown";
 }
@@ -489,9 +714,12 @@ void launchKernel(
     } else if (version == KernelVersion::V1) {
         const dim3 grid(N / BLOCK_N, M / BLOCK_M);
         wmmaGemmSharedV1<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
-    } else {
+    } else if (version == KernelVersion::V1_1) {
         const dim3 grid(N / BLOCK_N, M / BLOCK_M);
         wmmaGemmSharedV1_1<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    } else {
+        const dim3 grid(N / BLOCK_N_V2, M / BLOCK_M_V2);
+        wmmaGemmSharedV2<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
     }
 }
 
@@ -588,6 +816,76 @@ BenchmarkResult benchmarkKernel(
     return result;
 }
 
+// Benchmark all supported kernels in a rotating order. This keeps the same
+// warmup and timed-launch counts while reducing fixed-order clock/temperature
+// bias in close comparisons such as V1.1 versus V2 at 1024 cubed.
+vector<BenchmarkResult> benchmarkKernelsInterleaved(
+    const vector<KernelVersion>& versions,
+    const half* d_A,
+    const half* d_B,
+    float* d_C,
+    int M,
+    int N,
+    int K,
+    int warmup_runs,
+    int benchmark_runs,
+    int measurement_rounds)
+{
+    vector<BenchmarkResult> results(versions.size());
+    for (BenchmarkResult& result : results) {
+        result.latencies_ms.reserve(measurement_rounds);
+    }
+
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    for (int round = 0; round < measurement_rounds; ++round) {
+        for (size_t position = 0; position < versions.size(); ++position) {
+            const size_t index = (position + round) % versions.size();
+            const KernelVersion version = versions[index];
+
+            for (int i = 0; i < warmup_runs; ++i) {
+                launchKernel(version, d_A, d_B, d_C, M, N, K);
+            }
+            CHECK_CUDA(cudaGetLastError());
+            CHECK_CUDA(cudaDeviceSynchronize());
+
+            CHECK_CUDA(cudaEventRecord(start));
+            for (int i = 0; i < benchmark_runs; ++i) {
+                launchKernel(version, d_A, d_B, d_C, M, N, K);
+            }
+            CHECK_CUDA(cudaEventRecord(stop));
+            CHECK_CUDA(cudaGetLastError());
+            CHECK_CUDA(cudaEventSynchronize(stop));
+
+            float total_ms = 0.0f;
+            CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+            results[index].latencies_ms.push_back(total_ms / benchmark_runs);
+        }
+    }
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    const double flops = 2.0 * static_cast<double>(M) * N * K;
+    for (BenchmarkResult& result : results) {
+        for (float latency : result.latencies_ms) {
+            result.average_ms += latency;
+        }
+        result.average_ms /= result.latencies_ms.size();
+
+        vector<float> sorted = result.latencies_ms;
+        sort(sorted.begin(), sorted.end());
+        result.median_ms = sorted[sorted.size() / 2];
+        result.average_tflops =
+            flops / (result.average_ms / 1000.0) / 1.0e12;
+        result.median_tflops =
+            flops / (result.median_ms / 1000.0) / 1.0e12;
+    }
+    return results;
+}
+
 void printCorrectness(
     KernelVersion version,
     const CorrectnessResult& result)
@@ -644,6 +942,9 @@ bool runCase(
 {
     const bool v1_supported = M % BLOCK_M == 0 && N % BLOCK_N == 0 &&
                               K % BLOCK_K == 0;
+    const bool v2_supported = M % BLOCK_M_V2 == 0 &&
+                              N % BLOCK_N_V2 == 0 &&
+                              K % BLOCK_K_V2 == 0;
     const int warmup_runs = 10;
     const int benchmark_runs = 100;
     const int measurement_rounds = 5;
@@ -710,6 +1011,8 @@ bool runCase(
 
     CorrectnessResult v1_correctness;
     CorrectnessResult v1_1_correctness;
+    CorrectnessResult v2_correctness;
+    ErrorStats v1_1_v2_stats;
     if (v1_supported) {
         cout << "V1 shared launch = (" << N / BLOCK_N << ", "
              << M / BLOCK_M << ") blocks x " << THREADS_PER_BLOCK
@@ -726,28 +1029,54 @@ bool runCase(
             h_reference_original, h_reference_quantized, M, N, K, C_bytes);
         printCorrectness(KernelVersion::V1_1, v1_1_correctness);
     } else {
-        cout << "V1 shared: skipped (requires M/N multiples of 32 and K "
+        cout << "V1/V1.1: skipped (requires M/N multiples of 32 and K "
                 "a multiple of 16); V0 remains supported for multiples of 16."
              << endl;
     }
 
+    if (v2_supported) {
+        vector<float> h_C_v1_1 = h_C;
+        cout << "V2 fragment-reuse launch = (" << N / BLOCK_N_V2 << ", "
+             << M / BLOCK_M_V2 << ") blocks x " << THREADS_PER_BLOCK
+             << " threads (2 x 2 warps/block, 32 x 32 C/warp)" << endl;
+        v2_correctness = checkKernel(
+            KernelVersion::V2, d_A, d_B, d_C, h_C,
+            h_reference_original, h_reference_quantized, M, N, K, C_bytes);
+        printCorrectness(KernelVersion::V2, v2_correctness);
+        v1_1_v2_stats = compareResults(
+            h_C_v1_1, h_C,
+            numeric_limits<float>::infinity(),
+            numeric_limits<float>::infinity());
+        cout << "V1.1 vs V2 max absolute difference = "
+             << v1_1_v2_stats.max_abs_error << endl;
+        cout << "V1.1 vs V2 max relative difference = "
+             << v1_1_v2_stats.max_rel_error << endl;
+    } else {
+        cout << "V2 fragment-reuse: skipped (requires M/N multiples of 64 "
+                "and K a multiple of 16)." << endl;
+    }
+
     if (run_benchmark) {
-        BenchmarkResult v0_benchmark = benchmarkKernel(
-            KernelVersion::V0, d_A, d_B, d_C, M, N, K,
-            warmup_runs, benchmark_runs, measurement_rounds);
-        printBenchmark(KernelVersion::V0, v0_benchmark,
-                       warmup_runs, benchmark_runs);
+        vector<KernelVersion> benchmark_versions{KernelVersion::V0};
         if (v1_supported) {
-            BenchmarkResult v1_benchmark = benchmarkKernel(
-                KernelVersion::V1, d_A, d_B, d_C, M, N, K,
-                warmup_runs, benchmark_runs, measurement_rounds);
-            printBenchmark(KernelVersion::V1, v1_benchmark,
+            benchmark_versions.push_back(KernelVersion::V1);
+            benchmark_versions.push_back(KernelVersion::V1_1);
+        }
+        if (v2_supported) {
+            benchmark_versions.push_back(KernelVersion::V2);
+        }
+        vector<BenchmarkResult> benchmark_results = benchmarkKernelsInterleaved(
+            benchmark_versions, d_A, d_B, d_C, M, N, K,
+            warmup_runs, benchmark_runs, measurement_rounds);
+        for (size_t i = 0; i < benchmark_versions.size(); ++i) {
+            printBenchmark(benchmark_versions[i], benchmark_results[i],
                            warmup_runs, benchmark_runs);
-            BenchmarkResult v1_1_benchmark = benchmarkKernel(
-                KernelVersion::V1_1, d_A, d_B, d_C, M, N, K,
-                warmup_runs, benchmark_runs, measurement_rounds);
-            printBenchmark(KernelVersion::V1_1, v1_1_benchmark,
-                           warmup_runs, benchmark_runs);
+        }
+
+        if (v1_supported) {
+            const BenchmarkResult& v0_benchmark = benchmark_results[0];
+            const BenchmarkResult& v1_benchmark = benchmark_results[1];
+            const BenchmarkResult& v1_1_benchmark = benchmark_results[2];
             cout << fixed << setprecision(4);
             cout << "V1/V0 speedup (median latency) = "
                  << v0_benchmark.median_ms / v1_benchmark.median_ms
@@ -755,6 +1084,12 @@ bool runCase(
             cout << "V1.1/V1 speedup (median latency) = "
                  << v1_benchmark.median_ms / v1_1_benchmark.median_ms
                  << "x" << endl;
+            if (v2_supported) {
+                const BenchmarkResult& v2_benchmark = benchmark_results[3];
+                cout << "V2/V1.1 speedup (median latency) = "
+                     << v1_1_benchmark.median_ms / v2_benchmark.median_ms
+                     << "x" << endl;
+            }
         }
     }
 
@@ -763,7 +1098,9 @@ bool runCase(
     CHECK_CUDA(cudaFree(d_C));
     return v0_correctness.correct &&
            (!v1_supported ||
-            (v1_correctness.correct && v1_1_correctness.correct));
+            (v1_correctness.correct && v1_1_correctness.correct)) &&
+           (!v2_supported ||
+            (v2_correctness.correct && v1_1_v2_stats.finite));
 }
 
 int main(int argc, char** argv)
@@ -805,6 +1142,10 @@ int main(int argc, char** argv)
     if (M != 64 || N != 96 || K != 32) {
         correct = runCase(64, 96, 32, false, "small 2x2 warp-mapping test") &&
                   correct;
+    }
+    if (M != 128 || N != 192 || K != 64) {
+        correct = runCase(128, 192, 64, false,
+                          "V2 non-square warp-mapping test") && correct;
     }
     return correct ? EXIT_SUCCESS : EXIT_FAILURE;
 }
