@@ -29,7 +29,7 @@ constexpr int B_SHARED_STRIDE = 40;
 constexpr int WARPS_M = 2;
 constexpr int WARPS_N = 2;
 
-
+//V2
 constexpr int BLOCK_M_V2 = 64;
 constexpr int BLOCK_N_V2 = 64;
 constexpr int BLOCK_K_V2 = 16;
@@ -42,6 +42,24 @@ constexpr int WARPS_N_V2 = 2;
 
 constexpr int B_SHARED_STRIDE_V2_1 = 72;
 
+//V3
+// V3: 128-bit Vectorized Loading
+constexpr int VEC_WIDTH_V3 = sizeof(uint4) / sizeof(half);
+
+constexpr int BLOCK_M_V3 = 64;
+constexpr int BLOCK_N_V3 = 64;
+constexpr int BLOCK_K_V3 = 16;
+
+constexpr int WARP_TILE_M_V3 = 32;
+constexpr int WARP_TILE_N_V3 = 32;
+
+constexpr int WARPS_M_V3 = 2;
+constexpr int WARPS_N_V3 = 2;
+
+constexpr int A_VECS_PER_ROW_V3 = BLOCK_K_V3 / VEC_WIDTH_V3;
+constexpr int B_VECS_PER_ROW_V3 = BLOCK_N_V3 / VEC_WIDTH_V3;
+
+constexpr int B_SHARED_STRIDE_V3 = B_SHARED_STRIDE_V2_1;
 
 static_assert(WARPS_M * WARPS_N == WARPS_PER_BLOCK,
               "The 2D warp layout must match the block warp count");
@@ -66,6 +84,27 @@ static_assert(B_SHARED_STRIDE_V2_1 >= BLOCK_N_V2 &&
               B_SHARED_STRIDE_V2_1 % 8 == 0,
               "V2.1 B shared stride must cover the logical tile and satisfy "
               "the half WMMA leading-dimension constraint");
+static_assert(sizeof(uint4) == 16 && VEC_WIDTH_V3 == 8,
+              "V3 vector loads must move eight half elements (128 bits)");
+static_assert(WARPS_M_V3 * WARPS_N_V3 == WARPS_PER_BLOCK,
+              "The V3 warp layout must match the block warp count");
+static_assert(BLOCK_M_V3 == WARPS_M_V3 * WARP_TILE_M_V3 &&
+              BLOCK_N_V3 == WARPS_N_V3 * WARP_TILE_N_V3 &&
+              BLOCK_K_V3 == WMMA_K,
+              "V3 block and warp tiles are inconsistent");
+static_assert(WARP_TILE_M_V3 == 2 * WMMA_M &&
+              WARP_TILE_N_V3 == 2 * WMMA_N,
+              "Each V3 warp tile must contain four WMMA tiles");
+static_assert(BLOCK_K_V3 % VEC_WIDTH_V3 == 0 &&
+              BLOCK_N_V3 % VEC_WIDTH_V3 == 0,
+              "V3 A/B rows must be divisible by the vector width");
+static_assert(BLOCK_M_V3 * A_VECS_PER_ROW_V3 == THREADS_PER_BLOCK &&
+              BLOCK_K_V3 * B_VECS_PER_ROW_V3 == THREADS_PER_BLOCK,
+              "V3 requires exactly one A vector and one B vector per thread");
+static_assert(B_SHARED_STRIDE_V3 == 72 &&
+              B_SHARED_STRIDE_V3 >= BLOCK_N_V3 &&
+              B_SHARED_STRIDE_V3 % VEC_WIDTH_V3 == 0,
+              "V3 B shared stride must be 72 aligned half elements");
 
 #define CHECK_CUDA(call)                                                     \
     do {                                                                     \
@@ -739,6 +778,129 @@ __global__ void wmmaGemmSharedV2_1(
     wmma::store_matrix_sync(C11_ptr, c11, N, wmma::mem_row_major);
 }
 
+//V3 128-bit Load/Store
+__global__ void wmmaGemmV3(
+    const half* A,
+    const half* B,
+    float* C,
+    int M,
+    int N,
+    int K)
+{
+    int tid = threadIdx.x;
+
+    int block_row = blockIdx.y * BLOCK_M_V3;
+    int block_col = blockIdx.x * BLOCK_N_V3;
+
+    int warp_id = tid / 32;
+    int warp_row = warp_id / WARPS_N_V3;
+    int warp_col = warp_id % WARPS_N_V3;
+
+    int warp_c_row = block_row + warp_row * WARP_TILE_M_V3;
+    int warp_c_col = block_col + warp_col * WARP_TILE_N_V3;
+
+    __shared__ __align__(32) half As[BLOCK_M_V3][BLOCK_K_V3];
+    __shared__ __align__(32) half Bs[BLOCK_K_V3][B_SHARED_STRIDE_V3];
+
+    using AFrag = wmma::fragment<
+        wmma::matrix_a,
+        WMMA_M, WMMA_N, WMMA_K,
+        half,
+        wmma::row_major
+    >;
+
+    using BFrag = wmma::fragment<
+        wmma::matrix_b,
+        WMMA_M, WMMA_N, WMMA_K,
+        half,
+        wmma::row_major
+    >;
+
+    AFrag a0, a1;
+    BFrag b;
+
+    using AccFrag = wmma::fragment<
+        wmma::accumulator,
+        WMMA_M, WMMA_N, WMMA_K,
+        float
+    >;
+
+    AccFrag c00;
+    AccFrag c01;
+    AccFrag c10;
+    AccFrag c11;
+
+    wmma::fill_fragment(c00, 0.0f);
+    wmma::fill_fragment(c01, 0.0f);
+    wmma::fill_fragment(c10, 0.0f);
+    wmma::fill_fragment(c11, 0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += BLOCK_K_V3) {
+        // Cooperative Load A
+        int row_As = tid / A_VECS_PER_ROW_V3;
+        int col_As = (tid % A_VECS_PER_ROW_V3) * VEC_WIDTH_V3;
+
+        int row_A = block_row + row_As;
+        int col_A = k0 + col_As;
+
+        const half* srcA = A + row_A * K + col_A;
+        half* dstA = &As[row_As][col_As];
+
+        // A 的 128-bit 搬运
+        uint4 dataA = *reinterpret_cast<const uint4*>(srcA);
+        *reinterpret_cast<uint4*>(dstA) = dataA;
+
+
+        // Cooperative Load B
+        int row_Bs = tid / B_VECS_PER_ROW_V3;
+        int col_Bs = (tid % B_VECS_PER_ROW_V3) * VEC_WIDTH_V3;
+
+        int row_B = k0 + row_Bs;
+        int col_B = block_col + col_Bs;
+
+        const half* srcB = B + row_B * N + col_B;
+        half* dstB = &Bs[row_Bs][col_Bs];
+
+        // B 的 128-bit 搬运
+        uint4 dataB = *reinterpret_cast<const uint4*>(srcB);
+        *reinterpret_cast<uint4*>(dstB) = dataB;
+
+        __syncthreads();
+
+        const half* A0_ptr = &As[warp_row * WARP_TILE_M_V3][0];
+        const half* A1_ptr = &As[warp_row * WARP_TILE_M_V3 + WMMA_M][0];
+
+        const half* B0_ptr = &Bs[0][warp_col * WARP_TILE_N_V3];
+        const half* B1_ptr = &Bs[0][warp_col * WARP_TILE_N_V3 + WMMA_N];
+
+        wmma::load_matrix_sync(a0, A0_ptr, BLOCK_K_V3);
+        wmma::load_matrix_sync(a1, A1_ptr, BLOCK_K_V3);
+
+        wmma::load_matrix_sync(b, B0_ptr, B_SHARED_STRIDE_V3);
+
+        wmma::mma_sync(c00, a0, b, c00);
+        wmma::mma_sync(c10, a1, b, c10);
+
+        wmma::load_matrix_sync(b, B1_ptr, B_SHARED_STRIDE_V3);
+
+        wmma::mma_sync(c01, a0, b, c01);
+        wmma::mma_sync(c11, a1, b, c11);
+
+        __syncthreads();
+    }
+
+    float* C00_ptr = C + warp_c_row * N + warp_c_col;
+    float* C01_ptr = C + warp_c_row * N + warp_c_col + WMMA_N;
+    float* C10_ptr = C + (warp_c_row + WMMA_M) * N + warp_c_col;
+    float* C11_ptr =
+        C + (warp_c_row + WMMA_M) * N + warp_c_col + WMMA_N;
+
+    wmma::store_matrix_sync(C00_ptr, c00, N, wmma::mem_row_major);
+    wmma::store_matrix_sync(C01_ptr, c01, N, wmma::mem_row_major);
+    wmma::store_matrix_sync(C10_ptr, c10, N, wmma::mem_row_major);
+    wmma::store_matrix_sync(C11_ptr, c11, N, wmma::mem_row_major);
+}
+
 // CPU FP32 reference. The same routine is used for both original FP32 inputs
 // and FP16-quantized inputs converted back to FP32.
 void gemmCPU(
@@ -803,7 +965,7 @@ ErrorStats compareResults(
     return stats;
 }
 
-enum class KernelVersion { V0, V1, V1_1, V2, V2_1, CUBLAS };
+enum class KernelVersion { V0, V1, V1_1, V2, V2_1, V3, CUBLAS };
 
 struct BenchmarkResult {
     vector<float> latencies_ms;
@@ -832,6 +994,8 @@ const char* kernelName(KernelVersion version)
             return "V2 fragment-reuse";
         case KernelVersion::V2_1:
             return "V2.1 B-padding-72";
+        case KernelVersion::V3:
+            return "V3 128-bit vectorized staging";
         case KernelVersion::CUBLAS:
             return "cuBLAS GemmEx";
     }
@@ -866,6 +1030,9 @@ void launchKernel(
     } else if (version == KernelVersion::V2_1) {
         const dim3 grid(N / BLOCK_N_V2, M / BLOCK_M_V2);
         wmmaGemmSharedV2_1<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    } else if (version == KernelVersion::V3) {
+        const dim3 grid(N / BLOCK_N_V3, M / BLOCK_M_V3);
+        wmmaGemmV3<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
     } else {
         // cuBLAS is column-major. The row-major identity
         // C^T = (A B)^T = B^T A^T lets the same buffers represent an
@@ -1115,6 +1282,9 @@ bool runCase(
     const bool v2_supported = M % BLOCK_M_V2 == 0 &&
                               N % BLOCK_N_V2 == 0 &&
                               K % BLOCK_K_V2 == 0;
+    const bool v3_supported = M % BLOCK_M_V3 == 0 &&
+                              N % BLOCK_N_V3 == 0 &&
+                              K % BLOCK_K_V3 == 0;
     const int warmup_runs = 10;
     const int benchmark_runs = 100;
     const int measurement_rounds = 5;
@@ -1183,11 +1353,15 @@ bool runCase(
     CorrectnessResult v1_1_correctness;
     CorrectnessResult v2_correctness;
     CorrectnessResult v2_1_correctness;
+    CorrectnessResult v3_correctness;
     CorrectnessResult cublas_correctness;
     ErrorStats v1_1_v2_stats;
     ErrorStats v2_v2_1_stats;
+    ErrorStats v2_1_v3_stats;
     ErrorStats v2_1_cublas_stats;
+    ErrorStats v3_cublas_stats;
     vector<float> h_C_v2_1;
+    vector<float> h_C_v3;
     if (v1_supported) {
         cout << "V1 shared launch = (" << N / BLOCK_N << ", "
              << M / BLOCK_M << ") blocks x " << THREADS_PER_BLOCK
@@ -1249,6 +1423,31 @@ bool runCase(
                 "of 64 and K a multiple of 16)." << endl;
     }
 
+    if (v3_supported) {
+        cout << "V3 128-bit vectorized staging launch = ("
+             << N / BLOCK_N_V3 << ", " << M / BLOCK_M_V3
+             << ") blocks x " << THREADS_PER_BLOCK
+             << " threads (2 x 2 warps/block, 32 x 32 C/warp)" << endl;
+        v3_correctness = checkKernel(
+            KernelVersion::V3, d_A, d_B, d_C, h_C,
+            h_reference_original, h_reference_quantized, M, N, K, C_bytes);
+        printCorrectness(KernelVersion::V3, v3_correctness);
+        h_C_v3 = h_C;
+        if (v2_supported) {
+            v2_1_v3_stats = compareResults(
+                h_C_v2_1, h_C,
+                numeric_limits<float>::infinity(),
+                numeric_limits<float>::infinity());
+            cout << "V2.1 vs V3 max absolute difference = "
+                 << v2_1_v3_stats.max_abs_error << endl;
+            cout << "V2.1 vs V3 max relative difference = "
+                 << v2_1_v3_stats.max_rel_error << endl;
+        }
+    } else {
+        cout << "V3 vectorized staging: skipped (requires M/N multiples "
+                "of 64 and K a multiple of 16)." << endl;
+    }
+
     cout << "cuBLAS GemmEx launch: FP16 A/B, FP32 C/compute, "
             "CUBLAS_GEMM_DEFAULT" << endl;
     cublas_correctness = checkKernel(
@@ -1266,6 +1465,16 @@ bool runCase(
         cout << "V2.1 vs cuBLAS max relative difference = "
              << v2_1_cublas_stats.max_rel_error << endl;
     }
+    if (v3_supported) {
+        v3_cublas_stats = compareResults(
+            h_C_v3, h_C,
+            numeric_limits<float>::infinity(),
+            numeric_limits<float>::infinity());
+        cout << "V3 vs cuBLAS max absolute difference = "
+             << v3_cublas_stats.max_abs_error << endl;
+        cout << "V3 vs cuBLAS max relative difference = "
+             << v3_cublas_stats.max_rel_error << endl;
+    }
 
     if (run_benchmark) {
         vector<KernelVersion> benchmark_versions;
@@ -1273,6 +1482,9 @@ bool runCase(
             benchmark_versions.push_back(KernelVersion::V2_1);
         } else {
             benchmark_versions.push_back(KernelVersion::V0);
+        }
+        if (v3_supported) {
+            benchmark_versions.push_back(KernelVersion::V3);
         }
         benchmark_versions.push_back(KernelVersion::CUBLAS);
         vector<BenchmarkResult> benchmark_results = benchmarkKernelsInterleaved(
@@ -1282,9 +1494,10 @@ bool runCase(
             printBenchmark(benchmark_versions[i], benchmark_results[i],
                            warmup_runs, benchmark_runs);
         }
-        if (v2_supported) {
+        if (v2_supported && v3_supported) {
             const BenchmarkResult& v2_1_benchmark = benchmark_results[0];
-            const BenchmarkResult& cublas_benchmark = benchmark_results[1];
+            const BenchmarkResult& v3_benchmark = benchmark_results[1];
+            const BenchmarkResult& cublas_benchmark = benchmark_results[2];
             cout << fixed << setprecision(4);
             cout << "V2.1 / cuBLAS TFLOPS ratio = "
                  << v2_1_benchmark.median_tflops /
@@ -1293,6 +1506,16 @@ bool runCase(
             cout << "cuBLAS latency / V2.1 latency = "
                  << cublas_benchmark.median_ms /
                         v2_1_benchmark.median_ms
+                 << "x" << endl;
+            cout << "V3 / V2.1 speedup = "
+                 << v2_1_benchmark.median_ms / v3_benchmark.median_ms
+                 << "x" << endl;
+            cout << "V3 / cuBLAS TFLOPS ratio = "
+                 << v3_benchmark.median_tflops /
+                        cublas_benchmark.median_tflops
+                 << endl;
+            cout << "cuBLAS latency / V3 latency = "
+                 << cublas_benchmark.median_ms / v3_benchmark.median_ms
                  << "x" << endl;
         }
     }
@@ -1306,7 +1529,10 @@ bool runCase(
            (!v2_supported ||
             (v2_correctness.correct && v2_1_correctness.correct &&
              v1_1_v2_stats.finite && v2_v2_1_stats.finite &&
-             v2_1_cublas_stats.finite));
+             v2_1_cublas_stats.finite)) &&
+           (!v3_supported ||
+            (v3_correctness.correct && v2_1_v3_stats.finite &&
+             v3_cublas_stats.finite));
 }
 
 int main(int argc, char** argv)
