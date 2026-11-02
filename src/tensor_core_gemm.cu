@@ -1033,8 +1033,8 @@ __global__ void wmmaGemmV4_1(
 }
 
 
-//V4_2 异步访存
-__global__ void wmmaGemmV4_1(
+//V4_2 异步访存+双缓冲
+__global__ void wmmaGemmV4_2(
     const half* A,
     const half* B,
     float* C,
@@ -1054,8 +1054,8 @@ __global__ void wmmaGemmV4_1(
     int warp_c_row = block_row + warp_row * WARP_TILE_M_V3;
     int warp_c_col = block_col + warp_col * WARP_TILE_N_V3;
 
-    __shared__ __align__(32) half As[BLOCK_M_V3][BLOCK_K_V3];
-    __shared__ __align__(32) half Bs[BLOCK_K_V3][B_SHARED_STRIDE_V3];
+    __shared__ __align__(32) half As[2][BLOCK_M_V3][BLOCK_K_V3];
+    __shared__ __align__(32) half Bs[2][BLOCK_K_V3][B_SHARED_STRIDE_V3];
 
     using AFrag = wmma::fragment<
         wmma::matrix_a,
@@ -1090,49 +1090,90 @@ __global__ void wmmaGemmV4_1(
     wmma::fill_fragment(c10, 0.0f);
     wmma::fill_fragment(c11, 0.0f);
 
-    for (int k0 = 0; k0 < K; k0 += BLOCK_K_V3) {
+    //Prologue（流水线预热）
+    int num_k_tiles = K / BLOCK_K_V3;
+    int current = 0;
+    int next = 1;
+
         // Cooperative Load A
-        int row_As = tid / A_VECS_PER_ROW_V3;
-        int col_As = (tid % A_VECS_PER_ROW_V3) * VEC_WIDTH_V3;
+    int row_As = tid / A_VECS_PER_ROW_V3;
+    int col_As = (tid % A_VECS_PER_ROW_V3) * VEC_WIDTH_V3;
 
-        int row_A = block_row + row_As;
-        int col_A = k0 + col_As;
+    int row_A = block_row + row_As;
+    int col_A = 0 + col_As;
 
-        const half* srcA = A + row_A * K + col_A;
-        half* dstA = &As[row_As][col_As];
+    const half* srcA = A + row_A * K + col_A;
+    half* dstA = &As[current][row_As][col_As];
 
         // 异步搬运 A：Global → Shared，16B
-        __pipeline_memcpy_async(dstA, srcA, 16);
+    __pipeline_memcpy_async(dstA, srcA, 16);
 
 
         // Cooperative Load B
-        int row_Bs = tid / B_VECS_PER_ROW_V3;
-        int col_Bs = (tid % B_VECS_PER_ROW_V3) * VEC_WIDTH_V3;
+    int row_Bs = tid / B_VECS_PER_ROW_V3;
+    int col_Bs = (tid % B_VECS_PER_ROW_V3) * VEC_WIDTH_V3;
 
-        int row_B = k0 + row_Bs;
-        int col_B = block_col + col_Bs;
+    int row_B = 0 + row_Bs;
+    int col_B = block_col + col_Bs;
 
-        const half* srcB = B + row_B * N + col_B;
-        half* dstB = &Bs[row_Bs][col_Bs];
+    const half* srcB = B + row_B * N + col_B;
+    half* dstB = &Bs[current][row_Bs][col_Bs];
 
         // 异步搬运 B：Global → Shared，16B
-        __pipeline_memcpy_async(dstB, srcB, 16);
+    __pipeline_memcpy_async(dstB, srcB, 16);
 
         // 提交当前线程的异步复制
-        __pipeline_commit();
+    __pipeline_commit();
 
         // 等待当前线程此前提交的所有复制完成
-        __pipeline_wait_prior(0);
+    __pipeline_wait_prior(0);
 
         //等待 CTA 中其他线程完成各自的复制和等待
-        __syncthreads();
+    __syncthreads();
 
 
-        const half* A0_ptr = &As[warp_row * WARP_TILE_M_V3][0];
-        const half* A1_ptr = &As[warp_row * WARP_TILE_M_V3 + WMMA_M][0];
+    //Steady State（稳定流水阶段）
+    for (int tile = 0; tile < num_k_tiles; tile++){
+        //如果存在下一 Tile，提前发起异步搬运
+        if(tile + 1 < num_k_tiles){
+            // Cooperative Load A
+            int row_As = tid / A_VECS_PER_ROW_V3;
+            int col_As = (tid % A_VECS_PER_ROW_V3) * VEC_WIDTH_V3;
 
-        const half* B0_ptr = &Bs[0][warp_col * WARP_TILE_N_V3];
-        const half* B1_ptr = &Bs[0][warp_col * WARP_TILE_N_V3 + WMMA_N];
+            int row_A = block_row + row_As;
+            int col_A = (tile + 1) * BLOCK_K_V3 + col_As;
+
+            const half* srcA = A + row_A * K + col_A;
+            half* dstA = &As[next][row_As][col_As];
+
+            // 异步搬运 A：Global → Shared，16B
+            __pipeline_memcpy_async(dstA, srcA, 16);
+
+
+            // Cooperative Load B
+            int row_Bs = tid / B_VECS_PER_ROW_V3;
+            int col_Bs = (tid % B_VECS_PER_ROW_V3) * VEC_WIDTH_V3;
+
+            int row_B = (tile + 1) * BLOCK_K_V3 + row_Bs;
+            int col_B = block_col + col_Bs;
+
+            const half* srcB = B + row_B * N + col_B;
+            half* dstB = &Bs[next][row_Bs][col_Bs];
+
+            // 异步搬运 B：Global → Shared，16B
+            __pipeline_memcpy_async(dstB, srcB, 16);
+
+            // 提交当前线程的异步复制
+            __pipeline_commit();
+        }
+
+
+        //用当前 Buffer 中已经准备好的数据计算
+        const half* A0_ptr = &As[current][warp_row * WARP_TILE_M_V3][0];
+        const half* A1_ptr = &As[current][warp_row * WARP_TILE_M_V3 + WMMA_M][0];
+
+        const half* B0_ptr = &Bs[current][0][warp_col * WARP_TILE_N_V3];
+        const half* B1_ptr = &Bs[current][0][warp_col * WARP_TILE_N_V3 + WMMA_N];
 
         wmma::load_matrix_sync(a0, A0_ptr, BLOCK_K_V3);
         wmma::load_matrix_sync(a1, A1_ptr, BLOCK_K_V3);
@@ -1147,8 +1188,22 @@ __global__ void wmmaGemmV4_1(
         wmma::mma_sync(c01, a0, b, c01);
         wmma::mma_sync(c11, a1, b, c11);
 
-        __syncthreads();
+        //等待下一 Tile 完成，并完成 CTA 同步
+        if(tile + 1 < num_k_tiles){
+            // 等待当前线程此前提交的所有复制完成
+            __pipeline_wait_prior(0);
+
+            //等待 CTA 中其他线程完成各自的复制和等待
+            __syncthreads();
+        }
+
+        current ^= 1;
+        next ^= 1;
     }
+
+    //Epilogue（流水线收尾）
+    // 最后一个 K Tile 已在主循环中完成计算，无需额外 Epilogue。
+
 
     float* C00_ptr = C + warp_c_row * N + warp_c_col;
     float* C01_ptr = C + warp_c_row * N + warp_c_col + WMMA_N;
@@ -1226,7 +1281,9 @@ ErrorStats compareResults(
     return stats;
 }
 
-enum class KernelVersion { V0, V1, V1_1, V2, V2_1, V3, V4_1, CUBLAS };
+enum class KernelVersion {
+    V0, V1, V1_1, V2, V2_1, V3, V4_1, V4_2, CUBLAS
+};
 
 struct BenchmarkResult {
     vector<float> latencies_ms;
@@ -1259,6 +1316,8 @@ const char* kernelName(KernelVersion version)
             return "V3 128-bit vectorized staging";
         case KernelVersion::V4_1:
             return "V4.1 single-buffer cp.async staging";
+        case KernelVersion::V4_2:
+            return "V4.2 double-buffer cp.async staging";
         case KernelVersion::CUBLAS:
             return "cuBLAS GemmEx";
     }
@@ -1299,6 +1358,9 @@ void launchKernel(
     } else if (version == KernelVersion::V4_1) {
         const dim3 grid(N / BLOCK_N_V3, M / BLOCK_M_V3);
         wmmaGemmV4_1<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    } else if (version == KernelVersion::V4_2) {
+        const dim3 grid(N / BLOCK_N_V3, M / BLOCK_M_V3);
+        wmmaGemmV4_2<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
     } else {
         // cuBLAS is column-major. The row-major identity
         // C^T = (A B)^T = B^T A^T lets the same buffers represent an
@@ -1621,17 +1683,22 @@ bool runCase(
     CorrectnessResult v2_1_correctness;
     CorrectnessResult v3_correctness;
     CorrectnessResult v4_1_correctness;
+    CorrectnessResult v4_2_correctness;
     CorrectnessResult cublas_correctness;
     ErrorStats v1_1_v2_stats;
     ErrorStats v2_v2_1_stats;
     ErrorStats v2_1_v3_stats;
     ErrorStats v3_v4_1_stats;
+    ErrorStats v3_v4_2_stats;
+    ErrorStats v4_1_v4_2_stats;
     ErrorStats v2_1_cublas_stats;
     ErrorStats v3_cublas_stats;
     ErrorStats v4_1_cublas_stats;
+    ErrorStats v4_2_cublas_stats;
     vector<float> h_C_v2_1;
     vector<float> h_C_v3;
     vector<float> h_C_v4_1;
+    vector<float> h_C_v4_2;
     if (v1_supported) {
         cout << "V1 shared launch = (" << N / BLOCK_N << ", "
              << M / BLOCK_M << ") blocks x " << THREADS_PER_BLOCK
@@ -1734,8 +1801,36 @@ bool runCase(
                      ? "Passed!"
                      : "Mismatch!")
              << endl;
+
+        cout << "V4.2 double-buffer cp.async staging launch = ("
+             << N / BLOCK_N_V3 << ", " << M / BLOCK_M_V3
+             << ") blocks x " << THREADS_PER_BLOCK
+             << " threads (2 x 2 warps/block, 32 x 32 C/warp)" << endl;
+        v4_2_correctness = checkKernel(
+            KernelVersion::V4_2, d_A, d_B, d_C, h_C,
+            h_reference_original, h_reference_quantized, M, N, K, C_bytes);
+        printCorrectness(KernelVersion::V4_2, v4_2_correctness);
+        h_C_v4_2 = h_C;
+        v3_v4_2_stats = compareResults(h_C_v3, h_C, 0.0f, 0.0f);
+        v4_1_v4_2_stats = compareResults(h_C_v4_1, h_C, 0.0f, 0.0f);
+        cout << "V3 vs V4.2 max absolute difference = "
+             << v3_v4_2_stats.max_abs_error << endl;
+        cout << "V3 vs V4.2 max relative difference = "
+             << v3_v4_2_stats.max_rel_error << endl;
+        cout << "V4.1 vs V4.2 max absolute difference = "
+             << v4_1_v4_2_stats.max_abs_error << endl;
+        cout << "V4.1 vs V4.2 max relative difference = "
+             << v4_1_v4_2_stats.max_rel_error << endl;
+        cout << "V3/V4.1 vs V4.2 exact output comparison: "
+             << (v3_v4_2_stats.finite &&
+                         v3_v4_2_stats.within_tolerance &&
+                         v4_1_v4_2_stats.finite &&
+                         v4_1_v4_2_stats.within_tolerance
+                     ? "Passed!"
+                     : "Mismatch!")
+             << endl;
     } else {
-        cout << "V3/V4.1 staging: skipped (requires M/N multiples "
+        cout << "V3/V4.1/V4.2 staging: skipped (requires M/N multiples "
                 "of 64 and K a multiple of 16)." << endl;
     }
 
@@ -1773,6 +1868,14 @@ bool runCase(
              << v4_1_cublas_stats.max_abs_error << endl;
         cout << "V4.1 vs cuBLAS max relative difference = "
              << v4_1_cublas_stats.max_rel_error << endl;
+        v4_2_cublas_stats = compareResults(
+            h_C_v4_2, h_C,
+            numeric_limits<float>::infinity(),
+            numeric_limits<float>::infinity());
+        cout << "V4.2 vs cuBLAS max absolute difference = "
+             << v4_2_cublas_stats.max_abs_error << endl;
+        cout << "V4.2 vs cuBLAS max relative difference = "
+             << v4_2_cublas_stats.max_rel_error << endl;
     }
 
     if (run_benchmark) {
@@ -1785,6 +1888,7 @@ bool runCase(
         if (v3_supported) {
             benchmark_versions.push_back(KernelVersion::V3);
             benchmark_versions.push_back(KernelVersion::V4_1);
+            benchmark_versions.push_back(KernelVersion::V4_2);
         }
         benchmark_versions.push_back(KernelVersion::CUBLAS);
         vector<BenchmarkResult> benchmark_results = benchmarkKernelsInterleaved(
@@ -1798,7 +1902,8 @@ bool runCase(
             const BenchmarkResult& v2_1_benchmark = benchmark_results[0];
             const BenchmarkResult& v3_benchmark = benchmark_results[1];
             const BenchmarkResult& v4_1_benchmark = benchmark_results[2];
-            const BenchmarkResult& cublas_benchmark = benchmark_results[3];
+            const BenchmarkResult& v4_2_benchmark = benchmark_results[3];
+            const BenchmarkResult& cublas_benchmark = benchmark_results[4];
             cout << fixed << setprecision(4);
             cout << "V2.1 / cuBLAS TFLOPS ratio = "
                  << v2_1_benchmark.median_tflops /
@@ -1828,6 +1933,19 @@ bool runCase(
             cout << "cuBLAS latency / V4.1 latency = "
                  << cublas_benchmark.median_ms / v4_1_benchmark.median_ms
                  << "x" << endl;
+            cout << "V4.2 / V3 speedup = "
+                 << v3_benchmark.median_ms / v4_2_benchmark.median_ms
+                 << "x" << endl;
+            cout << "V4.2 / V4.1 speedup = "
+                 << v4_1_benchmark.median_ms / v4_2_benchmark.median_ms
+                 << "x" << endl;
+            cout << "V4.2 / cuBLAS TFLOPS ratio = "
+                 << v4_2_benchmark.median_tflops /
+                        cublas_benchmark.median_tflops
+                 << endl;
+            cout << "cuBLAS latency / V4.2 latency = "
+                 << cublas_benchmark.median_ms / v4_2_benchmark.median_ms
+                 << "x" << endl;
         }
     }
 
@@ -1843,9 +1961,12 @@ bool runCase(
              v2_1_cublas_stats.finite)) &&
            (!v3_supported ||
             (v3_correctness.correct && v4_1_correctness.correct &&
-             v2_1_v3_stats.finite && v3_v4_1_stats.finite &&
-             v3_v4_1_stats.within_tolerance && v3_cublas_stats.finite &&
-             v4_1_cublas_stats.finite));
+             v4_2_correctness.correct && v2_1_v3_stats.finite &&
+             v3_v4_1_stats.finite && v3_v4_1_stats.within_tolerance &&
+             v3_v4_2_stats.finite && v3_v4_2_stats.within_tolerance &&
+             v4_1_v4_2_stats.finite &&
+             v4_1_v4_2_stats.within_tolerance && v3_cublas_stats.finite &&
+             v4_1_cublas_stats.finite && v4_2_cublas_stats.finite));
 }
 
 int main(int argc, char** argv)
