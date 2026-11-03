@@ -15,3 +15,13 @@ __global__ void fp8_gemm_v1(
     int M,
     int N,
     int K);
+
+// V2 has the same contract and launch configuration as V1. Its only kernel
+// change is loading each four-byte A/B fragment with one ld.global.b32.
+__global__ void fp8_gemm_v2(
+    const __nv_fp8_e4m3* A,
+    const __nv_fp8_e4m3* B,
+    float* C,
+    int M,
+    int N,
+    int K);
