@@ -25,3 +25,14 @@ __global__ void fp8_gemm_v2(
     int M,
     int N,
     int K);
+
+// V3 keeps V2's fragment layout and 32-bit global loads, but groups four
+// warps in a 2 x 2 layout. Launch with block(128) and
+// grid(N / 16, M / 32); M, N and K must be multiples of 32, 16 and 32.
+__global__ void fp8_gemm_v3(
+    const __nv_fp8_e4m3* A,
+    const __nv_fp8_e4m3* B,
+    float* C,
+    int M,
+    int N,
+    int K);

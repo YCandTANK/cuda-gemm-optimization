@@ -43,3 +43,10 @@ add_executable(fp8_gemm_v2_compare
 target_include_directories(fp8_gemm_v2_compare PRIVATE src)
 target_link_libraries(fp8_gemm_v2_compare PRIVATE CUDA::cudart)
 configure_cuda_target(fp8_gemm_v2_compare)
+
+add_executable(fp8_gemm_v3_compare
+    tests/fp8_gemm_v3_compare.cu
+    src/fp8_gemm.cu)
+target_include_directories(fp8_gemm_v3_compare PRIVATE src)
+target_link_libraries(fp8_gemm_v3_compare PRIVATE CUDA::cudart)
+configure_cuda_target(fp8_gemm_v3_compare)
