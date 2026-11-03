@@ -47,3 +47,13 @@ __global__ void fp8_gemm_v4(
     int M,
     int N,
     int K);
+
+// V5 keeps V4's launch/layout and applies the same XOR swizzle to shared
+// stores and loads: physical_word_k = word_k ^ (major_index & 4).
+__global__ void fp8_gemm_v5(
+    const __nv_fp8_e4m3* A,
+    const __nv_fp8_e4m3* B,
+    float* C,
+    int M,
+    int N,
+    int K);

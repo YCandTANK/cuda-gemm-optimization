@@ -490,9 +490,9 @@ __global__ void fp8_gemm_v4(
     // FP32 Accumulator
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
 
-    // 3. K Tile Loop
+    //  K Tile Loop
     for (int k0 = 0; k0 < K; k0 += 32) {
-        // 3.1 Global → Shared : A
+        //  Global → Shared : A
         // A 共 256 Words
         // 128 Threads，每个线程加载 2 Words
         #pragma unroll
@@ -521,7 +521,7 @@ __global__ void fp8_gemm_v4(
             As_words[row][word_k] = packed;
         }
 
-        // 3.2 Global → Shared : B
+        // Global → Shared : B
         // B 共 128 Words
         // 每个线程加载 1 Word
         int b_word = t;
@@ -550,7 +550,7 @@ __global__ void fp8_gemm_v4(
         // 确保整个 CTA 完成 Global → Shared
         __syncthreads();
 
-        // 3.3 Shared → Register : A Fragment
+        // Shared → Register : A Fragment
         uint32_t a_frag[4];
         uint32_t b_frag[2];
 
@@ -569,7 +569,7 @@ __global__ void fp8_gemm_v4(
                 As_words[shared_row][shared_word_k];
         }
 
-        // 3.4 Shared → Register : B Fragment
+        //Shared → Register : B Fragment
         #pragma unroll
         for (int r = 0; r < 2; r++) {
 
@@ -583,7 +583,7 @@ __global__ void fp8_gemm_v4(
                 Bs_words[shared_col][shared_word_k];
         }
 
-        // 3.5 FP8 Tensor Core MMA
+        // FP8 Tensor Core MMA
         float next[4];
 
         asm volatile(
@@ -622,7 +622,7 @@ __global__ void fp8_gemm_v4(
         __syncthreads();
     }
 
-    // 4. Register → Global : C
+    // Register → Global : C
     #pragma unroll
     for (int i = 0; i < 4; i++) {
 
@@ -639,4 +639,188 @@ __global__ void fp8_gemm_v4(
 }
 
 
+
+__global__ void fp8_gemm_v5(
+    const __nv_fp8_e4m3* A,
+    const __nv_fp8_e4m3* B,
+    float* C,
+    int M, int N, int K)
+{
+    //Thread / Warp Mapping
+    int t = threadIdx.x;
+
+    int warp_id = t / 32;
+    int lane = t % 32;
+
+    int group = lane / 4;
+    int tid = lane % 4;
+
+    int warp_m = warp_id / 2;
+    int warp_n = warp_id % 2;
+
+    int cta_m = blockIdx.y * 32;
+    int cta_n = blockIdx.x * 16;
+
+    int m0 = cta_m + warp_m * 16;
+    int n0 = cta_n + warp_n * 8;
+
+    //Shared Memory
+    //每个 uint32_t 存储 4 个 FP8
+    __shared__ uint32_t As_words[32][8];
+    __shared__ uint32_t Bs_words[16][8];
+
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+    // K Tile Loop
+    for (int k0 = 0; k0 < K; k0 += 32) {
+
+        //Global -> Shared : A
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            int word = t + i * 128;
+
+            int row = word / 8;
+            int word_k = word % 8;
+
+            int global_row = cta_m + row;
+            int global_col = k0 + word_k * 4;
+
+            int index = global_row * K + global_col;
+
+            uint32_t packed;
+
+            const __nv_fp8_e4m3* ptr = A + index;
+
+            asm volatile(
+                "ld.global.b32 %0, [%1];"
+                : "=r"(packed)
+                : "l"(ptr)
+                : "memory"
+            );
+
+            // V5: XOR Swizzling
+            int physical_word_k = word_k ^ (row & 4);
+
+            As_words[row][physical_word_k] = packed;
+        }
+
+        //Global -> Shared : B
+        int b_word = t;
+
+        int b_col = b_word / 8;
+        int b_word_k = b_word % 8;
+
+        int global_col = cta_n + b_col;
+        int global_row = k0 + b_word_k * 4;
+
+        int b_index = global_col * K + global_row;
+
+        uint32_t b_packed;
+
+        const __nv_fp8_e4m3* b_ptr = B + b_index;
+
+        asm volatile(
+            "ld.global.b32 %0, [%1];"
+            : "=r"(b_packed)
+            : "l"(b_ptr)
+            : "memory"
+        );
+
+        // V5: XOR Swizzling
+        int b_physical_word_k = b_word_k ^ (b_col & 4);
+
+        Bs_words[b_col][b_physical_word_k] = b_packed;
+
+        // Global -> Shared 写入完成
+        __syncthreads();
+
+        // Shared -> Register : A Fragment
+        uint32_t a_frag[4];
+        uint32_t b_frag[2];
+
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            int row = group + 8 * (r % 2);
+            int col = 4 * tid + 16 * (r / 2);
+
+            int shared_row = warp_m * 16 + row;
+            int shared_word_k = col / 4;
+
+            // V5: 使用相同 XOR 映射恢复原始 Fragment
+            int physical_word_k =
+                shared_word_k ^ (shared_row & 4);
+
+            a_frag[r] =
+                As_words[shared_row][physical_word_k];
+        }
+
+        //Shared -> Register : B Fragment
+        #pragma unroll
+        for (int r = 0; r < 2; r++) {
+            int row = 4 * tid + 16 * r;
+            int col = group;
+
+            int shared_col = warp_n * 8 + col;
+            int shared_word_k = row / 4;
+
+            // V5: 使用相同 XOR 映射恢复原始 Fragment
+            int physical_word_k =
+                shared_word_k ^ (shared_col & 4);
+
+            b_frag[r] =
+                Bs_words[shared_col][physical_word_k];
+        }
+
+        // FP8 Tensor Core MMA
+        float next[4];
+
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0, %1, %2, %3}, "
+            "{%4, %5, %6, %7}, "
+            "{%8, %9}, "
+            "{%10, %11, %12, %13};\n"
+
+            : "=f"(next[0]),
+              "=f"(next[1]),
+              "=f"(next[2]),
+              "=f"(next[3])
+
+            : "r"(a_frag[0]),
+              "r"(a_frag[1]),
+              "r"(a_frag[2]),
+              "r"(a_frag[3]),
+
+              "r"(b_frag[0]),
+              "r"(b_frag[1]),
+
+              "f"(acc[0]),
+              "f"(acc[1]),
+              "f"(acc[2]),
+              "f"(acc[3])
+        );
+
+        acc[0] = next[0];
+        acc[1] = next[1];
+        acc[2] = next[2];
+        acc[3] = next[3];
+
+        // Single Buffer：保护下一轮覆盖
+        __syncthreads();
+    }
+
+    //Register -> Global : C
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int row = group + 8 * (i / 2);
+        int col = 2 * tid + (i % 2);
+
+        int global_row = m0 + row;
+        int global_col = n0 + col;
+
+        int index = global_row * N + global_col;
+
+        C[index] = acc[i];
+    }
+}
 
