@@ -36,3 +36,14 @@ __global__ void fp8_gemm_v3(
     int M,
     int N,
     int K);
+
+// V4 keeps V3's 4-warp 32 x 16 CTA tile and stages one 32-element K tile
+// through 1536 bytes of shared memory for A/B reuse. Launch with block(128)
+// and grid(N / 16, M / 32); M, N and K must be multiples of 32, 16 and 32.
+__global__ void fp8_gemm_v4(
+    const __nv_fp8_e4m3* A,
+    const __nv_fp8_e4m3* B,
+    float* C,
+    int M,
+    int N,
+    int K);
