@@ -1,0 +1,23 @@
+# WMMA 阶段实验归档
+
+这里保存 FP16 WMMA 路线各阶段的原始验证和性能记录。它们包含当时的 Git 状态、单轮测量、Profiler 明细和下一步假设，主要用于追溯实验过程；面向读者的稳定结论请优先阅读：
+
+- [`../../FINAL_ANALYSIS.md`](../../FINAL_ANALYSIS.md)：FP32 与 FP16 WMMA 总体分析；
+- [`../../WMMA_V4_ASYNC_PIPELINE_ANALYSIS.md`](../../WMMA_V4_ASYNC_PIPELINE_ANALYSIS.md)：V4.1–V4.3 async-copy / double-buffering 总结。
+
+归档内容按优化阶段排列：
+
+| 阶段 | 原始记录 |
+|---|---|
+| V1 | [`V1_PERFORMANCE_REPORT.md`](V1_PERFORMANCE_REPORT.md) |
+| V1.1 | [`V1_1_BANK_CONFLICT_REPORT.md`](V1_1_BANK_CONFLICT_REPORT.md) |
+| V2 | [`V2_PERFORMANCE_REPORT.md`](V2_PERFORMANCE_REPORT.md) |
+| V2.1 | [`V2_1_BANK_CONFLICT_REPORT.md`](V2_1_BANK_CONFLICT_REPORT.md) |
+| V3 前置诊断 | [`V3_PREOPT_PERFORMANCE_DIAGNOSIS.md`](V3_PREOPT_PERFORMANCE_DIAGNOSIS.md) |
+| V3 集成与复验 | [`V3_VALIDATION_REPORT.md`](V3_VALIDATION_REPORT.md)、[`V3_FINAL_VALIDATION_REPORT.md`](V3_FINAL_VALIDATION_REPORT.md) |
+| V4.1 | [`V4_1_VALIDATION_REPORT.md`](V4_1_VALIDATION_REPORT.md) |
+| V4.2 | [`V4_2_VALIDATION_REPORT.md`](V4_2_VALIDATION_REPORT.md)、[`V4_2_INSTRUCTION_ANALYSIS.md`](V4_2_INSTRUCTION_ANALYSIS.md) |
+| V4.3 | [`V4_3_VALIDATION_REPORT.md`](V4_3_VALIDATION_REPORT.md) |
+| 早期总报告 | [`FINAL_GEMM_PERFORMANCE_REPORT.md`](FINAL_GEMM_PERFORMANCE_REPORT.md) |
+
+这些文件是实验快照，其中“当前”“本轮”“未提交”等表述均指报告生成时的状态，不代表仓库现在的状态。

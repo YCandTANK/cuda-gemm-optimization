@@ -4,7 +4,7 @@
 
 项目不只展示最终 TFLOPS，也保留中间版本，并通过正确性测试、CUDA Event、SASS 和 Nsight Compute 建立从代码改动到性能结果的证据链。
 
-> FP32/FP16 路线的完整实验方法、性能数据和 profiler 分析见 [CUDA GEMM 优化最终分析](docs/FINAL_ANALYSIS.md)。FP8 路线当前已推进至 V5，最新的正确性、SASS、Nsight Compute 与性能证据见 [FP8 V5 验证与性能报告](FP8_V5_VALIDATION_AND_PERFORMANCE.md)。
+> FP32/FP16 路线的完整实验方法、性能数据和 profiler 分析见 [CUDA GEMM 优化最终分析](docs/FINAL_ANALYSIS.md)，WMMA V4 async pipeline 的专项结果见 [V4 实验总结](docs/WMMA_V4_ASYNC_PIPELINE_ANALYSIS.md)。FP8 路线当前已推进至 V5，最新的正确性、SASS、Nsight Compute 与性能证据见 [FP8 V5 验证与性能报告](FP8_V5_VALIDATION_AND_PERFORMANCE.md)。
 
 ## 项目亮点
 
@@ -12,6 +12,7 @@
 - CUDA Core FP32 路线在 `1024³` 上从 2.084 TFLOPS 提升至 14.755 TFLOPS，达到同轮 `cublasSgemm` 的 74.92%。
 - FP16 WMMA V2→V2.1 仅调整 B 的 shared-memory stride，使总 shared-load conflict 降低 87.40%。
 - FP16 WMMA V3 使用 128-bit Global→Shared staging；在 `2048³` 上达到 56.017 TFLOPS，为同轮默认 cuBLAS 的 95.46%。
+- FP16 WMMA V4.1–V4.3 验证了 `cp.async`、双缓冲和循环尾拆分；V4.3 相对 V4.2 将动态 warp 指令减少 37.31%，但尚未稳定超过 V3。
 - FP8 V5 使用 XOR Shared-Memory Swizzling，将 V4 的系统性平均 2-way Shared Load Bank Conflict 降低 99.946%；同轮 `1024³` 中位性能由 29.136 提高至 33.301 TFLOPS。
 - 使用实际量化输入的 CPU reference、NaN 预填充、guard、finite 检查和多形状固定种子测试验证结果正确性。
 
@@ -44,9 +45,12 @@ V0  Global → WMMA Fragment
  → V2    64×64 CTA Tile + Fragment Reuse
  → V2.1  B Shared Padding
  → V3    128-bit Global→Shared Staging
+ → V4.1  cp.async Single Buffer
+ → V4.2  cp.async Double Buffering
+ → V4.3  Branch-free Steady Loop + Explicit Epilogue
 ```
 
-Tensor Core 路线使用 FP16 A/B、FP32 accumulation 和 FP32 C；对照基线为相同数值配置下的默认 `cublasGemmEx`。
+Tensor Core 路线使用 FP16 A/B、FP32 accumulation 和 FP32 C；对照基线为相同数值配置下的默认 `cublasGemmEx`。V3 仍是有稳定性能证据支持的基线；V4.3 是更适合继续研究的双缓冲实现，但现有多批 Event 数据不足以声称它稳定更快。详见 [WMMA V4 Async Pipeline 实验总结](docs/WMMA_V4_ASYNC_PIPELINE_ANALYSIS.md)。
 
 ### FP8 Tensor Core GEMM
 
@@ -88,13 +92,13 @@ FP32、FP16 WMMA 与 FP8 路线的数据类型、执行单元、布局和测试�
 ## 正确性验证
 
 - FP32 主测试相对 CPU reference 的最大绝对误差低于程序使用的 `1e-5` 阈值，并覆盖非整 tile 形状。
-- Tensor Core 使用 FP16 量化后的输入计算 FP32 CPU reference，判定条件为：
+- Tensor Core 使用 FP16 量化后的输入计算 FP32 CPU reference，V2.1、V3 与 V4.1–V4.3 的判定条件为：
 
   ```text
   abs_error <= 1e-2 + 1e-2 * abs(reference)
   ```
 
-- V2.1、V3 和 cuBLAS 通过 5 种矩阵形状、5 个固定随机种子及多类输入分布测试。
+- V2.1、V3 和 cuBLAS 通过 5 种矩阵形状、5 个固定随机种子及多类输入分布测试；V4.1–V4.3 另覆盖 `K=16/32/48` 等 pipeline 边界和多个规则形状。
 - 每次运行前将输出矩阵填充为 NaN，并检查 reference、输出和误差均为 finite，以发现漏写 tile。
 - FP8 Reference 使用实际量化后的 E4M3 A/B 重新扩展为 FP32，再按 A Row-major、B Column-major 约定执行 FP32 FMA；V5 的判定条件为：
 
@@ -154,7 +158,7 @@ cmake --build build/cmake-sm120 --target \
 ## 仓库结构
 
 - [`src/gemm.cu`](src/gemm.cu)：CUDA Core FP32 SGEMM 各优化版本及 cuBLAS 对照。
-- [`src/tensor_core_gemm.cu`](src/tensor_core_gemm.cu)：WMMA V0–V3、正确性检查和 cuBLAS benchmark。
+- [`src/tensor_core_gemm.cu`](src/tensor_core_gemm.cu)：WMMA V0–V4.3、正确性检查和 cuBLAS benchmark。
 - [`src/fp8_gemm.cu`](src/fp8_gemm.cu)：FP8 E4M3 Tensor Core GEMM V1–V5 kernels。
 - [`src/fp8_gemm.cuh`](src/fp8_gemm.cuh)：FP8 V1–V5 kernel 声明。
 - [`tests/fp8_gemm_v1_test.cu`](tests/fp8_gemm_v1_test.cu)：FP8 V1 独立正确性与 CUDA Event 冻结基线。
@@ -164,11 +168,13 @@ cmake --build build/cmake-sm120 --target \
 - [`tests/fp8_gemm_v5_compare.cu`](tests/fp8_gemm_v5_compare.cu)：FP8 V4/V5 XOR Swizzling 对照。
 - [`tests/v3_random_correctness.cu`](tests/v3_random_correctness.cu)：V2.1、V3 和 cuBLAS 的多形状随机正确性测试。
 - [`docs/FINAL_ANALYSIS.md`](docs/FINAL_ANALYSIS.md)：完整性能结果、实验方法、Profiler 证据和限制说明。
+- [`docs/WMMA_V4_ASYNC_PIPELINE_ANALYSIS.md`](docs/WMMA_V4_ASYNC_PIPELINE_ANALYSIS.md)：WMMA V4.1–V4.3 async-copy、双缓冲与动态指令分析。
+- [`docs/archive/wmma/`](docs/archive/wmma/)：WMMA 各阶段原始实验记录。
 - [`FP8_V5_VALIDATION_AND_PERFORMANCE.md`](FP8_V5_VALIDATION_AND_PERFORMANCE.md)：最新 FP8 正确性、PTX/SASS、NCU 和性能报告。
 
 ## 已知限制
 
-- FP16 WMMA V3 要求 M/N 为 64 的倍数、K 为 16 的倍数，不满足条件时不会执行通用边界路径。
+- FP16 WMMA V3–V4.3 要求 M/N 为 64 的倍数、K 为 16 的倍数，不满足条件时不会执行通用边界路径。
 - FP8 V1/V2 要求 M/N/K 分别为 16/8/32 的整数倍；V3–V5 要求分别为 32/16/32 的整数倍，均无通用边界路径。
 - FP8 固定使用 A Row-major、B Column-major、C Row-major，并要求 Host 端提前完成 E4M3 量化和 scaling 策略；kernel 不接受 arbitrary leading dimension。
 - 当前未实现 batched GEMM、split-K 或融合 epilogue。

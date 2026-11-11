@@ -110,6 +110,9 @@ Tensor Core 路线使用 FP16 A/B、FP32 accumulator 和 FP32 C。默认 cuBLAS 
 | V2 | 64×64 block、32×32 warp tile；A/B fragment 各复用两次 | staging 与 fragment request 减半，但 B stride 64 产生 32/4 wavefronts；寄存器升至 56/thread |
 | V2.1 | 只把 V2 的 B stride 从 64 half 改为 72 | 两个 B load 均变为 4/4，总 shared-load conflict 降低 87.40% |
 | V3 | 保持 V2.1 的 tile、fragment reuse 和 B padding，改用 128-bit Global→Shared staging | 编译为 `LDG.E.128`/`STS.128`，显著减少搬运和地址指令 |
+| V4.1 | 用 `cp.async` 替换 V3 的同步 staging | 编译为 `LDGSTS`，但 single buffer 立即 wait，2048³ 出现回退 |
+| V4.2 | ping-pong shared planes 与跨 tile double buffering | 形成 copy/compute overlap 机会，但动态地址与控制指令明显增加 |
+| V4.3 | 将最后一 tile 从 steady loop 拆到显式 epilogue | 相对 V4.2 减少 37.31% 动态 warp 指令，但 Event 未显示稳定加速 |
 
 各阶段的直接对照均在相应实验中重新测量，而不是用不同日期的绝对时间相除。1024³ / 2048³ 的相对结果为：
 
@@ -165,7 +168,15 @@ V3 在 1024³ 和 2048³ 上分别达到同轮默认 cuBLAS 吞吐的 96.43% 和
 
 V3 仍有明确代价：78 registers/thread 将理论 occupancy 限制为 50%；A0/A1 各有 8/4 LDSM wavefront；Long Scoreboard 为 18.645 cycles/issued instruction。由于 V3 删除了大量标量指令，`cycles/issued instruction` 的分母也发生了变化，不能仅凭 stall 数值上升断言性能退化。
 
-### 5. 正确性验证
+### 5. V4 Async Pipeline 实验
+
+V4.1–V4.3 保持 V3 的 tile、fragment 布局和 C 写回不变，依次验证 async copy、双缓冲和无条件 steady loop。PTX/SASS 确认 V4 实际生成 `cp.async` 对应的 `LDGSTS`、`LDGDEPBAR` 与 `DEPBAR`；V4.2/V4.3 的下一 tile copy 位于当前 tile LDSM/HMMA 与 wait 之前，静态顺序确实提供 overlap 机会。
+
+V4.1 的 single-buffer 立即 wait 在 `2048³` 上比同轮 V3 慢约 5.12%。V4.2 将动态 CTA barrier 减半，并把这部分回退缩小到约 0.45%，但 executed warp instructions 从 V4.1 的 15,839,232 增至 24,944,640。专项 source-counter 分析把增量定位到稳态循环中的地址重建、predicate、branch 和 system-register 读取，而不是额外的 `LDGSTS`、LDSM 或 HMMA。
+
+V4.3 拆出最后一 tile 后，executed warp instructions 降至 15,638,528，寄存器由 78 降至 72/thread，Tensor Pipe Active 达到 89.697%。不过两批 `1024³` 和两批 `2048³` CUDA Event 对 V3/V4.2 的相对方向并不完全一致，因此当前不能声称 V4.3 稳定超过 V3。V3 继续作为稳定性能基线，V4.3 作为后续 async-pipeline 实验基线。完整数据和解释边界见 [WMMA V4 Async Pipeline 实验总结](WMMA_V4_ASYNC_PIPELINE_ANALYSIS.md)。
+
+### 6. 正确性验证
 
 程序先将 FP32 输入量化为 FP16，再把量化值转回 FP32 计算 CPU reference。Tensor kernel 和 cuBLAS 均与这套 reference 比较，判定条件为：
 
@@ -181,14 +192,14 @@ abs_error <= 1e-2 + 1e-2 * abs(reference)
 - `512×1024×256`：接近零的正负均匀分布；
 - `1024×512×1024`：截断正态分布，并注入 0/近零。
 
-V2.1、V3 和 cuBLAS 均通过。该次测试中三者输出恰好逐元素一致，但浮点 GEMM 的不同实现不保证 bitwise 等价，因此正确性标准仍是对量化输入 reference 的混合容差，而不是互相逐位相等。
+V2.1、V3 和 cuBLAS 均通过。V4.1–V4.3 另覆盖 `K=16/32/48` 的 pipeline 边界、`128×192×64`、`1024³` 和 `2048³`，均通过 CPU reference 与相邻版本对照。测试中各版本输出恰好逐元素一致，但浮点 GEMM 的不同实现不保证 bitwise 等价，因此正确性标准仍是对量化输入 reference 的混合容差，而不是互相逐位相等。
 
-### 6. 当前限制
+### 7. 当前限制
 
-- V3 要求 M/N 为 64 的倍数、K 为 16 的倍数；不满足条件时 runner 会跳过 V3，而不是执行通用边界路径。
+- V3–V4.3 要求 M/N 为 64 的倍数、K 为 16 的倍数；不满足条件时 runner 会跳过这些版本，而不是执行通用边界路径。
 - 当前只支持连续 Row-major 普通 GEMM，没有 arbitrary leading dimension、batched、split-K 或融合 epilogue。
 - 固定 64×64 CTA tile 只完成了方阵性能验证；随机测试中的非方阵用于正确性验证，不能据此声称非方阵性能接近 cuBLAS。
-- 尚未通过单变量实验确认 A shared padding、`cp.async`、double buffering 或降低寄存器能继续改善 V3。
+- `cp.async` 和 double buffering 已完成单变量实验，但尚未稳定改善 V3；A shared padding、V4 B-side async sector 开销和剩余地址链仍待研究。
 - cuBLAS 对照是默认 `cublasGemmEx`，没有搜索 cuBLASLt heuristic，也没有 profile cuBLAS 内部 kernel；因此不对其具体 tiling、流水或数据搬运策略作实测声明。
 
 ---
@@ -232,4 +243,4 @@ nvcc -std=c++17 -O3 -lineinfo -arch=sm_120 \
 
 CUDA Core 路线的主要收益来自二维 register blocking 与向量化；在 1024³ 快照中，最佳 V7_2 为 14.755 TFLOPS，是 Naive 的 7.08×、同轮 `cublasSgemm` 的 74.92%。后续 double buffering 和 prefetch 只有小幅收益，V8 warp-layout 实验还出现过回退。
 
-Tensor Core 路线先通过 shared tiling 和 fragment reuse减少重复工作，再用两个单变量 padding 实验定位并降低 B 侧 LDSM bank conflict，最后用 V3 的 128-bit staging 大幅减少搬运指令。V3 在更严格的双进程测试中达到 44.518 TFLOPS（1024³）和 56.017 TFLOPS（2048³），分别为同轮默认 cuBLAS 的 96.43% 和 95.46%。这些结果证明了当前实现对已测规则形状的有效性，但不代表对任意矩阵形状、GPU 或 GEMM 功能组合具有同等表现。
+Tensor Core 路线先通过 shared tiling 和 fragment reuse减少重复工作，再用两个单变量 padding 实验定位并降低 B 侧 LDSM bank conflict，随后用 V3 的 128-bit staging 大幅减少搬运指令。V3 在更严格的双进程测试中达到 44.518 TFLOPS（1024³）和 56.017 TFLOPS（2048³），分别为同轮默认 cuBLAS 的 96.43% 和 95.46%。V4.1–V4.3 进一步验证了 async copy 与双缓冲：V4.3 已显著压缩动态控制开销，但尚未稳定超过 V3。这些结果证明了当前实现对已测规则形状的有效性，但不代表对任意矩阵形状、GPU 或 GEMM 功能组合具有同等表现。
